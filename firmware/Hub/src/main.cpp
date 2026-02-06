@@ -1,6 +1,7 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
  * Универсальная версия с JSON структурой
+ * ВЕРСИЯ: Автообновление данных с датчиков
  */
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -42,6 +43,7 @@ void setup() {
     delay(1000);
 
     Serial.println("\n=== SmartHome ESP-NOW Hub (JSON версия) ===");
+    Serial.println("=== РЕЖИМ: АВТООБНОВЛЕНИЕ ДАННЫХ ===");
 
     // 1. WI-FI ТОЧКА ДОСТУПА
     Serial.print("Запуск точки доступа: ");
@@ -77,27 +79,38 @@ void setup() {
         .sensor-label { font-weight: bold; }
         .sensor-value { font-family: monospace; }
         .gpio-status { color: #9C27B0; }
+        #lastUpdate { font-size: 0.9em; color: #666; margin-top: 10px; text-align: right; }
     </style>
 </head>
 <body>
     <h1>🏠 Умный дом ESP-NOW</h1>
-    <p>MAC узла: AC:EB:E6:49:10:28 | ID: 101</p>
+    <p>MAC узла: AC:EB:E6:49:10:28 | ID: 101 | <span id="connectionStatus">✅ Связь активна</span></p>
     <button id="btnOn" onclick="sendCommand('LED_ON')">▶ ВКЛЮЧИТЬ LED</button>
     <button id="btnOff" onclick="sendCommand('LED_OFF')">⏸ ВЫКЛЮЧИТЬ LED</button>
-    <button id="btnStatus" onclick="sendCommand('GET_STATUS')">📡 ЗАПРОС ДАННЫХ</button>
-    <div id="status">Статус: Ожидание подключения к хабу...</div>
+    <button id="btnStatus" onclick="sendCommand('GET_STATUS')">🔄 ОБНОВИТЬ СЕЙЧАС</button>
+    
+    <div id="status">
+        <div>📊 <span class="data">Данные датчиков:</span></div>
+        <div id="sensorData">Ожидание данных от узла... Данные появятся здесь автоматически.</div>
+        <div id="lastUpdate">—</div>
+    </div>
 
     <script>
         const ws = new WebSocket('ws://' + window.location.hostname + '/ws');
+        let lastUpdateTime = null;
+        
         ws.onopen = function() {
-            document.getElementById('status').innerHTML = '✅ <span class="on">Подключён к хабу</span><br>Ожидание данных от узла...';
+            console.log('✅ WebSocket подключён');
+            document.getElementById('connectionStatus').textContent = '✅ Связь активна';
+            document.getElementById('sensorData').innerHTML = '<em>Ожидание первого пакета данных...</em>';
         };
+        
         ws.onmessage = function(event) {
             const msg = JSON.parse(event.data);
-            const statusElem = document.getElementById('status');
+            console.log('Получено сообщение:', msg);
             
             if(msg.type === 'node_status') {
-                statusElem.innerHTML = '📌 Статус узла: <span class="' + msg.state + '">' + msg.text + '</span>';
+                // Обновляем статус кнопок при ответе на команду
                 if(msg.state === 'on') {
                     document.getElementById('btnOn').style.opacity = '0.6';
                     document.getElementById('btnOff').style.opacity = '1';
@@ -105,9 +118,12 @@ void setup() {
                     document.getElementById('btnOn').style.opacity = '1';
                     document.getElementById('btnOff').style.opacity = '0.6';
                 }
+                // Можно показать всплывающее уведомление, но не обязательно
+                console.log('Статус узла:', msg.text);
             }
             else if(msg.type === 'sensor_data') {
-                let html = '📊 <span class="data">Данные датчиков:</span><br>';
+                // ОСНОВНОЙ БЛОК: ОБНОВЛЯЕМ ДАННЫЕ ДАТЧИКОВ
+                let html = '';
                 if(msg.aht20) {
                     html += '<div class="sensor-row"><span class="sensor-label">AHT20 (t):</span><span class="sensor-value">' + msg.aht20.temp + '°C</span></div>';
                     html += '<div class="sensor-row"><span class="sensor-label">AHT20 (h):</span><span class="sensor-value">' + msg.aht20.hum + '%</span></div>';
@@ -116,23 +132,52 @@ void setup() {
                     html += '<div class="sensor-row"><span class="sensor-label">BMP280 (t):</span><span class="sensor-value">' + msg.bmp280.temp + '°C</span></div>';
                     html += '<div class="sensor-row"><span class="sensor-label">BMP280 (p):</span><span class="sensor-value">' + msg.bmp280.press + ' mmHg</span></div>';
                 }
-                html += '<small>Обновлено: ' + new Date().toLocaleTimeString() + '</small>';
-                statusElem.innerHTML = html;
+                document.getElementById('sensorData').innerHTML = html;
+                
+                // Обновляем время последнего обновления
+                lastUpdateTime = new Date();
+                document.getElementById('lastUpdate').textContent = 'Обновлено: ' + lastUpdateTime.toLocaleTimeString();
             }
             else if(msg.type === 'gpio_status') {
+                // Обновляем статус светодиода, если нужно
                 let html = '🔌 <span class="gpio-status">Состояние GPIO:</span><br>';
                 if(msg.gpio8 !== undefined) {
                     html += '<div class="sensor-row"><span class="sensor-label">GPIO8 (LED):</span><span class="sensor-value">' + (msg.gpio8 ? 'ВКЛ' : 'ВЫКЛ') + '</span></div>';
+                    document.getElementById('sensorData').innerHTML += html;
                 }
-                statusElem.innerHTML = html;
             }
             else if(msg.type === 'hub_log') {
                 console.log('Хаб:', msg.text);
             }
         };
+        
+        ws.onclose = function() {
+            document.getElementById('connectionStatus').textContent = '❌ Связь потеряна';
+            document.getElementById('sensorData').innerHTML = '<em style="color: red;">Соединение с хабом разорвано. Перезагрузите страницу.</em>';
+        };
+        
         function sendCommand(cmd) {
-            ws.send(JSON.stringify({command: cmd}));
+            if(ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({command: cmd}));
+                console.log('Отправлена команда:', cmd);
+            }
         }
+        
+        // Функция для обновления времени "сколько секунд назад"
+        function updateTimeAgo() {
+            if(lastUpdateTime) {
+                const secondsAgo = Math.floor((new Date() - lastUpdateTime) / 1000);
+                const elem = document.getElementById('lastUpdate');
+                if(secondsAgo < 60) {
+                    elem.textContent = `Обновлено: ${secondsAgo} сек. назад`;
+                } else {
+                    elem.textContent = `Обновлено: ${lastUpdateTime.toLocaleTimeString()}`;
+                }
+            }
+        }
+        
+        // Запускаем таймер для обновления времени
+        setInterval(updateTimeAgo, 1000);
     </script>
 </body>
 </html>
@@ -170,7 +215,7 @@ void setup() {
     Serial.println("\n=== ХАБ ГОТОВ К РАБОТЕ ===");
     Serial.println("1. Подключитесь к Wi-Fi: " + String(AP_SSID));
     Serial.println("2. Откройте в браузере: http://" + WiFi.softAPIP().toString());
-    Serial.println("3. Используйте кнопки для управления\n");
+    Serial.println("3. Данные с датчиков будут обновляться автоматически каждые 30 сек.\n");
 }
 
 void loop() {
@@ -253,7 +298,8 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
     const char* type = doc["type"];
     
     if (strcmp(type, "sensor") == 0) {
-        // Данные датчиков
+        // ✅ ОСНОВНОЕ ИЗМЕНЕНИЕ: ВСЕГДА отправляем данные в веб-интерфейс
+        // Данные датчиков пришли (автоматически или по запросу)
         JsonObject data = doc["data"];
         StaticJsonDocument<300> response;
         response["type"] = "sensor_data";
@@ -270,6 +316,7 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
         String jsonResponse;
         serializeJson(response, jsonResponse);
         ws.textAll(jsonResponse);
+        Serial.println("📊 Данные с датчиков отправлены в веб-интерфейс.");
     }
     else if (strcmp(type, "ack") == 0) {
         // Подтверждение команд
