@@ -1,275 +1,312 @@
+/**
+ * SmartHome ESP-NOW Hub (ESP32)
+ * Универсальная версия с JSON структурой
+ */
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
 #include <esp_now.h>
 #include <ArduinoJson.h>
 
-// Структура сообщений ESP-NOW (должна совпадать с узлом!)
+// ---- 1. КОНФИГУРАЦИЯ ----
+const char* AP_SSID = "SmartHome-Hub";
+const char* AP_PASSWORD = "12345678";
+
+// MAC вашего узла (ESP32-C3)
+uint8_t nodeMacAddress[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
+
+// ---- 2. УНИВЕРСАЛЬНАЯ СТРУКТУРА ESP-NOW ----
 typedef struct esp_now_message {
-    char payload[256];
-    uint8_t sender_id;
-    char msg_type[16]; // "command", "sensor_data", "ack"
+    char json[192];      // {"type":"sensor", "data":{...}} или {"type":"command", "command":"LED_ON"}
+    uint8_t sender_id;   // ID отправителя
 } esp_now_message;
 
-// ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
-String hubStaMac = "";   // STA MAC (для ESP-NOW) - ОСНОВНОЙ!
-String hubApMac = "";    // AP MAC (для веб-интерфейса)
-String nodeMac = "";     // MAC узла, который подключится
-String lastSensorJson = "{}";
-String displayHtml = "";
-unsigned long lastUpdateTime = 0;
-
-AsyncWebServer server(80);
+esp_now_message outgoingMessage;
 esp_now_message incomingMessage;
 
-// Параметры точки доступа для веб-интерфейса
-const char* ap_ssid = "SmartHome-Hub";
-const char* ap_password = "12345678";
+// ---- 3. ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ----
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
 
-// HTML страница (остается как в вашем исходнике)
-const char index_html[] PROGMEM = R"rawliteral(
+// ---- 4. ПРОТОТИПЫ ФУНКЦИЙ ----
+void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+                     AwsEventType type, void *arg, uint8_t *data, size_t len);
+void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
+void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
+void sendToNode(String cmd);
+void broadcastWs(String type, String text, String state = "");
+
+// ===================== SETUP =====================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+
+    Serial.println("\n=== SmartHome ESP-NOW Hub (JSON версия) ===");
+
+    // 1. WI-FI ТОЧКА ДОСТУПА
+    Serial.print("Запуск точки доступа: ");
+    Serial.println(AP_SSID);
+    WiFi.mode(WIFI_AP);
+    if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
+        Serial.println("❌ Ошибка создания точки доступа!");
+        while(1) delay(1000);
+    }
+    Serial.print("IP адрес: ");
+    Serial.println(WiFi.softAPIP());
+
+    // 2. WEB-СЕРВЕР И WEB SOCKET
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String html = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Умный дом ESP-NOW</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Умный дом ESP-NOW</title>
     <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
-        .container { max-width: 800px; margin: auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #2c3e50; text-align: center; }
-        .btn { background: #3498db; color: white; border: none; padding: 12px 24px; margin: 5px; border-radius: 5px; cursor: pointer; font-size: 16px; }
-        .btn:hover { background: #2980b9; }
-        .btn-off { background: #e74c3c; }
-        .btn-off:hover { background: #c0392b; }
-        .sensor-box { background: #ecf0f1; border-radius: 8px; padding: 15px; margin: 15px 0; border-left: 5px solid #3498db; }
-        .sensor-title { color: #2c3e50; font-size: 1.2em; margin-bottom: 10px; }
-        .sensor-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px dashed #bdc3c7; }
-        .sensor-label { font-weight: bold; color: #34495e; }
-        .sensor-value { font-family: monospace; color: #16a085; font-weight: bold; }
-        .unit { color: #7f8c8d; font-size: 0.9em; }
-        #lastUpdate { text-align: center; color: #95a5a6; font-style: italic; margin-top: 20px; }
+        body {font-family: Arial; text-align: center; margin-top: 30px;}
+        button {font-size: 20px; padding: 15px 30px; margin: 10px; border: none; border-radius: 8px; cursor: pointer;}
+        #btnOn {background: #4CAF50; color: white;}
+        #btnOff {background: #f44336; color: white;}
+        #btnStatus {background: #2196F3; color: white;}
+        #status {margin-top: 30px; font-size: 18px; padding: 15px; background: #f5f5f5; border-radius: 8px; min-height: 60px; text-align: left;}
+        .on {color: #4CAF50; font-weight: bold;}
+        .off {color: #f44336; font-weight: bold;}
+        .data {color: #FF9800;}
+        .sensor-row { display: flex; justify-content: space-between; margin: 5px 0; }
+        .sensor-label { font-weight: bold; }
+        .sensor-value { font-family: monospace; }
+        .gpio-status { color: #9C27B0; }
     </style>
 </head>
 <body>
-    <div class="container">
-        <h1>🏠 Хаб умного дома ESP-NOW</h1>
-        <p style="text-align:center;">
-            <strong>STA MAC (ESP-NOW):</strong> %HUB_STA_MAC%<br>
-            <strong>AP MAC (Веб):</strong> %HUB_AP_MAC%<br>
-            <strong>Узел:</strong> <span id="nodeMacField">%NODE_MAC%</span>
-        </p>
-        
-        <div style="text-align:center;">
-            <button class="btn" onclick="sendCmd('LED_ON')">Включить LED</button>
-            <button class="btn btn-off" onclick="sendCmd('LED_OFF')">Выключить LED</button>
-            <button class="btn" onclick="sendCmd('GET_STATUS')">Обновить данные</button>
-        </div>
-
-        <div id="sensorDisplay">
-            %SENSOR_DATA%
-        </div>
-
-        <div id="lastUpdate">Ожидание данных от узла...</div>
-    </div>
+    <h1>🏠 Умный дом ESP-NOW</h1>
+    <p>MAC узла: AC:EB:E6:49:10:28 | ID: 101</p>
+    <button id="btnOn" onclick="sendCommand('LED_ON')">▶ ВКЛЮЧИТЬ LED</button>
+    <button id="btnOff" onclick="sendCommand('LED_OFF')">⏸ ВЫКЛЮЧИТЬ LED</button>
+    <button id="btnStatus" onclick="sendCommand('GET_STATUS')">📡 ЗАПРОС ДАННЫХ</button>
+    <div id="status">Статус: Ожидание подключения к хабу...</div>
 
     <script>
-        function sendCmd(cmd) {
-            fetch('/cmd?cmd=' + cmd)
-                .then(r => r.text())
-                .then(txt => console.log('Ответ:', txt));
+        const ws = new WebSocket('ws://' + window.location.hostname + '/ws');
+        ws.onopen = function() {
+            document.getElementById('status').innerHTML = '✅ <span class="on">Подключён к хабу</span><br>Ожидание данных от узла...';
+        };
+        ws.onmessage = function(event) {
+            const msg = JSON.parse(event.data);
+            const statusElem = document.getElementById('status');
+            
+            if(msg.type === 'node_status') {
+                statusElem.innerHTML = '📌 Статус узла: <span class="' + msg.state + '">' + msg.text + '</span>';
+                if(msg.state === 'on') {
+                    document.getElementById('btnOn').style.opacity = '0.6';
+                    document.getElementById('btnOff').style.opacity = '1';
+                } else {
+                    document.getElementById('btnOn').style.opacity = '1';
+                    document.getElementById('btnOff').style.opacity = '0.6';
+                }
+            }
+            else if(msg.type === 'sensor_data') {
+                let html = '📊 <span class="data">Данные датчиков:</span><br>';
+                if(msg.aht20) {
+                    html += '<div class="sensor-row"><span class="sensor-label">AHT20 (t):</span><span class="sensor-value">' + msg.aht20.temp + '°C</span></div>';
+                    html += '<div class="sensor-row"><span class="sensor-label">AHT20 (h):</span><span class="sensor-value">' + msg.aht20.hum + '%</span></div>';
+                }
+                if(msg.bmp280) {
+                    html += '<div class="sensor-row"><span class="sensor-label">BMP280 (t):</span><span class="sensor-value">' + msg.bmp280.temp + '°C</span></div>';
+                    html += '<div class="sensor-row"><span class="sensor-label">BMP280 (p):</span><span class="sensor-value">' + msg.bmp280.press + ' mmHg</span></div>';
+                }
+                html += '<small>Обновлено: ' + new Date().toLocaleTimeString() + '</small>';
+                statusElem.innerHTML = html;
+            }
+            else if(msg.type === 'gpio_status') {
+                let html = '🔌 <span class="gpio-status">Состояние GPIO:</span><br>';
+                if(msg.gpio8 !== undefined) {
+                    html += '<div class="sensor-row"><span class="sensor-label">GPIO8 (LED):</span><span class="sensor-value">' + (msg.gpio8 ? 'ВКЛ' : 'ВЫКЛ') + '</span></div>';
+                }
+                statusElem.innerHTML = html;
+            }
+            else if(msg.type === 'hub_log') {
+                console.log('Хаб:', msg.text);
+            }
+        };
+        function sendCommand(cmd) {
+            ws.send(JSON.stringify({command: cmd}));
         }
-
-        setInterval(() => {
-            fetch('/data')
-                .then(r => r.json())
-                .then(data => {
-                    if(data.html) {
-                        document.getElementById('sensorDisplay').innerHTML = data.html;
-                        document.getElementById('lastUpdate').textContent = 'Обновлено: ' + new Date().toLocaleTimeString();
-                    }
-                    if(data.nodeMac) {
-                        document.getElementById('nodeMacField').textContent = data.nodeMac;
-                    }
-                });
-        }, 10000);
     </script>
 </body>
 </html>
-)rawliteral";
-
-// ========== CALLBACK-ФУНКЦИИ ESP-NOW ==========
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-    Serial.print("[ХАБ] Статус отправки: ");
-    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "✅ Успех" : "❌ Ошибка");
-}
-
-void OnDataRecv(const uint8_t *mac, const uint8_t *incomingData, int len) {
-    // Сохраняем MAC узла (который прислал данные)
-    char macStr[18];
-    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-    nodeMac = String(macStr);
-    Serial.print("[ХАБ] Данные от узла: ");
-    Serial.print(nodeMac);
-    Serial.print(" | ");
-
-    if (len <= sizeof(incomingMessage)) {
-        memcpy(&incomingMessage, incomingData, len);
-        
-        if (strcmp(incomingMessage.msg_type, "sensor_data") == 0) {
-            lastSensorJson = String(incomingMessage.payload);
-            lastUpdateTime = millis();
-            Serial.println("Данные датчиков");
-            
-            // Парсинг JSON от узла
-            StaticJsonDocument<512> doc;
-            DeserializationError error = deserializeJson(doc, lastSensorJson);
-            
-            if (!error) {
-                displayHtml = "";
-                
-                // Данные AHT20
-                if (doc.containsKey("AHT20")) {
-                    displayHtml += "<div class='sensor-box'><div class='sensor-title'>🌡️ Датчик AHT20</div>";
-                    displayHtml += "<div class='sensor-row'><span class='sensor-label'>Температура:</span><span class='sensor-value'>";
-                    displayHtml += String(doc["AHT20"]["temp"].as<float>(), 1);
-                    displayHtml += "<span class='unit'>°C</span></span></div>";
-                    
-                    displayHtml += "<div class='sensor-row'><span class='sensor-label'>Влажность:</span><span class='sensor-value'>";
-                    displayHtml += String(doc["AHT20"]["hum"].as<float>(), 1);
-                    displayHtml += "<span class='unit'>%</span></span></div>";
-                    displayHtml += "</div>";
-                }
-                
-                // Данные BMP280
-                if (doc.containsKey("BMP280")) {
-                    JsonObject bmp = doc["BMP280"];
-                    displayHtml += "<div class='sensor-box'><div class='sensor-title'>📊 Датчик BMP280</div>";
-                    displayHtml += "<div class='sensor-row'><span class='sensor-label'>Температура:</span><span class='sensor-value'>";
-                    displayHtml += String(bmp["temp"].as<float>(), 1);
-                    displayHtml += "<span class='unit'>°C</span></span></div>";
-                    
-                    displayHtml += "<div class='sensor-row'><span class='sensor-label'>Давление:</span><span class='sensor-value'>";
-                    displayHtml += String(bmp["press_mmHg"].as<float>(), 1);
-                    displayHtml += "<span class='unit'>мм рт. ст.</span></span></div>";
-                    displayHtml += "</div>";
-                }
-                
-                Serial.println("[ХАБ] HTML сформирован.");
-            } else {
-                Serial.println("[ХАБ] Ошибка парсинга JSON!");
-                displayHtml = "<div class='no-data'>Ошибка формата данных</div>";
-            }
-        }
-        else if (strcmp(incomingMessage.msg_type, "ack") == 0) {
-            Serial.print("Подтверждение: ");
-            Serial.println(incomingMessage.payload);
-        }
-    }
-}
-
-void setup() {
-    Serial.begin(115200);
-    delay(1000);
-    
-    Serial.println("\n" + String(60, '='));
-    Serial.println("        ХАБ ESP32 (ИСПРАВЛЕННАЯ ВЕРСИЯ)");
-    Serial.println(String(60, '='));
-
-    // ========== КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: WIFI_AP_STA ==========
-    WiFi.mode(WIFI_AP_STA); // Гибридный режим
-    
-    // 1. Инициализируем точку доступа для веб-интерфейса
-    WiFi.softAP(ap_ssid, ap_password);
-    hubApMac = WiFi.softAPmacAddress();
-    
-    // 2. Получаем STA MAC-адрес для ESP-NOW
-    hubStaMac = WiFi.macAddress();
-    
-    Serial.println("[ХАБ] ДИАГНОСТИКА MAC-АДРЕСОВ:");
-    Serial.print("  STA MAC (для ESP-NOW): ");
-    Serial.println(hubStaMac);
-    Serial.print("  AP  MAC (для веб-интерфейса): ");
-    Serial.println(hubApMac);
-    Serial.print("  IP веб-интерфейса: ");
-    Serial.println(WiFi.softAPIP());
-    Serial.println();
-
-    // ========== ИНИЦИАЛИЗАЦИЯ ESP-NOW ==========
-    // Важно: ESP-NOW будет использовать STA интерфейс!
-    esp_err_t initResult = esp_now_init();
-    if (initResult != ESP_OK) {
-        Serial.printf("[ХАБ] Критическая ошибка инициализации ESP-NOW! Код: %d\n", initResult);
-        while(1) { delay(1000); }
-    }
-    Serial.println("[ХАБ] ESP-NOW успешно инициализирован (на STA интерфейсе).");
-
-    esp_now_register_send_cb(OnDataSent);
-    esp_now_register_recv_cb(OnDataRecv);
-    Serial.println("[ХАБ] Callback-функции зарегистрированы.");
-
-    // ========== ВЕБ-СЕРВЕР ==========
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-        String html = FPSTR(index_html);
-        html.replace("%HUB_STA_MAC%", hubStaMac);
-        html.replace("%HUB_AP_MAC%", hubApMac);
-        html.replace("%NODE_MAC%", nodeMac.length() > 0 ? nodeMac : "не подключён");
-        html.replace("%SENSOR_DATA%", displayHtml.length() > 0 ? displayHtml : 
-                    "<div class='sensor-box'><div class='sensor-title'>📡 Ожидание данных</div><p style='text-align:center;color:#95a5a6;'>Подключите узел ESP32-C3</p></div>");
+        )rawliteral";
         request->send(200, "text/html", html);
     });
-    
-    server.on("/data", HTTP_GET, [](AsyncWebServerRequest *request) {
-        StaticJsonDocument<200> resp;
-        resp["html"] = displayHtml;
-        resp["nodeMac"] = nodeMac;
-        String jsonResponse;
-        serializeJson(resp, jsonResponse);
-        request->send(200, "application/json", jsonResponse);
-    });
-    
-    server.on("/cmd", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (request->hasParam("cmd")) {
-            String command = request->getParam("cmd")->value();
-            Serial.printf("[ХАБ] Веб-команда: '%s'\n", command.c_str());
-            
-            if (nodeMac.length() == 0) {
-                request->send(200, "text/plain", "❌ Узел не подключён.");
-                return;
-            }
-            
-            // Преобразуем MAC строку в массив для отправки
-            uint8_t nodeMacAddr[6];
-            sscanf(nodeMac.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-                   &nodeMacAddr[0], &nodeMacAddr[1], &nodeMacAddr[2],
-                   &nodeMacAddr[3], &nodeMacAddr[4], &nodeMacAddr[5]);
-            
-            // Подготавливаем сообщение ESP-NOW
-            esp_now_message outgoingMsg;
-            memset(&outgoingMsg, 0, sizeof(outgoingMsg));
-            strncpy(outgoingMsg.msg_type, "command", sizeof(outgoingMsg.msg_type)-1);
-            strncpy(outgoingMsg.payload, command.c_str(), sizeof(outgoingMsg.payload)-1);
-            outgoingMsg.sender_id = 200;
-            
-            // Отправляем
-            esp_err_t result = esp_now_send(nodeMacAddr, (uint8_t *)&outgoingMsg, sizeof(outgoingMsg));
-            
-            if (result == ESP_OK) {
-                request->send(200, "text/plain", "✅ Команда '" + command + "' отправлена на " + nodeMac);
-            } else {
-                request->send(200, "text/plain", "❌ Ошибка отправки. Код: " + String(result));
-            }
-        }
-    });
 
+    ws.onEvent(onWebSocketEvent);
+    server.addHandler(&ws);
     server.begin();
-    Serial.println("[ХАБ] HTTP сервер запущен.");
-    Serial.println("[ХАБ] Готов к работе. Ожидаю узел...");
-    Serial.println(String(60, '='));
-    Serial.println("ВАЖНО: Укажите в коде узла STA MAC хаба: " + hubStaMac);
-    Serial.println(String(60, '='));
+    Serial.println("✅ Веб-сервер и WebSocket запущены.");
+
+    // 3. ИНИЦИАЛИЗАЦИЯ ESP-NOW
+    WiFi.mode(WIFI_AP_STA);
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("❌ Ошибка инициализации ESP-NOW!");
+        while(1) delay(1000);
+    }
+
+    // Регистрация колбэков
+    esp_now_register_send_cb(onEspNowDataSent);
+    esp_now_register_recv_cb(onEspNowDataRecv);
+
+    // Добавление узла как пира
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, nodeMacAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+        Serial.println("❌ Не удалось добавить узел в ESP-NOW!");
+    } else {
+        Serial.println("✅ Узел добавлен в ESP-NOW.");
+    }
+
+    Serial.println("\n=== ХАБ ГОТОВ К РАБОТЕ ===");
+    Serial.println("1. Подключитесь к Wi-Fi: " + String(AP_SSID));
+    Serial.println("2. Откройте в браузере: http://" + WiFi.softAPIP().toString());
+    Serial.println("3. Используйте кнопки для управления\n");
 }
 
 void loop() {
-    delay(1000);
+    ws.cleanupClients();
+    delay(10);
+}
+
+// ===================== WEB SOCKET ОБРАБОТЧИК =====================
+void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+                     AwsEventType type, void *arg, uint8_t *data, size_t len) {
+    if (type == WS_EVT_DATA) {
+        StaticJsonDocument<200> doc;
+        DeserializationError error = deserializeJson(doc, data, len);
+        if (!error && doc.containsKey("command")) {
+            String cmd = doc["command"].as<String>();
+            Serial.print("📨 Веб-команда: ");
+            Serial.println(cmd);
+            sendToNode(cmd);
+        }
+    }
+}
+
+// ===================== ОТПРАВКА НА УЗЕЛ =====================
+void sendToNode(String cmd) {
+    // Формируем JSON команды
+    char json_cmd[64];
+    snprintf(json_cmd, sizeof(json_cmd), "{\"type\":\"command\",\"command\":\"%s\"}", cmd.c_str());
+    
+    strncpy(outgoingMessage.json, json_cmd, sizeof(outgoingMessage.json)-1);
+    outgoingMessage.json[sizeof(outgoingMessage.json)-1] = '\0';
+    outgoingMessage.sender_id = 1; // ID хаба
+    
+    esp_err_t result = esp_now_send(nodeMacAddress, (uint8_t *) &outgoingMessage, sizeof(outgoingMessage));
+    
+    if (result == ESP_OK) {
+        Serial.print("📡 Отправлена команда: ");
+        Serial.println(cmd);
+        broadcastWs("hub_log", "Команда '" + cmd + "' отправлена на узел", "");
+    } else {
+        Serial.print("❌ Ошибка отправки: ");
+        Serial.println(result);
+    }
+}
+
+// ===================== ESP-NOW КОЛБЭКИ =====================
+void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    Serial.print("✉️ Доставка ESP-NOW: ");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "✅ Успех" : "❌ Ошибка");
+}
+
+void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
+    // --- ФИЛЬТР: Принимаем данные ТОЛЬКО от нашего узла ---
+    uint8_t allowedNodeMac[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
+    if (memcmp(mac_addr, allowedNodeMac, 6) != 0) {
+        char macStr[18];
+        snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac_addr[0], mac_addr[1], mac_addr[2],
+                 mac_addr[3], mac_addr[4], mac_addr[5]);
+        Serial.print("[ХАБ] Игнорирую чужой узел: ");
+        Serial.println(macStr);
+        return;
+    }
+    // --- КОНЕЦ ФИЛЬТРА ---
+
+    memcpy(&incomingMessage, incomingData, sizeof(incomingMessage));
+    
+    Serial.print("📥 JSON от узла: ");
+    Serial.println(incomingMessage.json);
+
+    // Парсим JSON от узла
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, incomingMessage.json);
+    
+    if (error) {
+        Serial.print("❌ Ошибка парсинга JSON: ");
+        Serial.println(error.c_str());
+        return;
+    }
+    
+    const char* type = doc["type"];
+    
+    if (strcmp(type, "sensor") == 0) {
+        // Данные датчиков
+        JsonObject data = doc["data"];
+        StaticJsonDocument<300> response;
+        response["type"] = "sensor_data";
+        
+        if (data.containsKey("AHT20")) {
+            response["aht20"]["temp"] = data["AHT20"]["temp"].as<String>();
+            response["aht20"]["hum"] = data["AHT20"]["hum"].as<String>();
+        }
+        if (data.containsKey("BMP280")) {
+            response["bmp280"]["temp"] = data["BMP280"]["temp"].as<String>();
+            response["bmp280"]["press"] = data["BMP280"]["press_mmHg"].as<String>();
+        }
+        
+        String jsonResponse;
+        serializeJson(response, jsonResponse);
+        ws.textAll(jsonResponse);
+    }
+    else if (strcmp(type, "ack") == 0) {
+        // Подтверждение команд
+        const char* cmd = doc["command"];
+        if (strcmp(cmd, "LED_ON") == 0) {
+            broadcastWs("node_status", "LED на узле ВКЛЮЧЁН", "on");
+        }
+        else if (strcmp(cmd, "LED_OFF") == 0) {
+            broadcastWs("node_status", "LED на узле ВЫКЛЮЧЕН", "off");
+        }
+    }
+    else if (strcmp(type, "gpio") == 0) {
+        // Состояние GPIO
+        StaticJsonDocument<200> response;
+        response["type"] = "gpio_status";
+        
+        if (doc.containsKey("pin") && doc.containsKey("state")) {
+            int pin = doc["pin"];
+            int state = doc["state"];
+            if (pin == 8) {
+                response["gpio8"] = state;
+            }
+        }
+        
+        String jsonResponse;
+        serializeJson(response, jsonResponse);
+        ws.textAll(jsonResponse);
+    }
+}
+
+// ===================== ОТПРАВКА В WEB SOCKET =====================
+void broadcastWs(String type, String text, String state) {
+    StaticJsonDocument<200> doc;
+    doc["type"] = type;
+    doc["text"] = text;
+    if (state.length() > 0) doc["state"] = state;
+    String jsonResponse;
+    serializeJson(doc, jsonResponse);
+    ws.textAll(jsonResponse);
 }
