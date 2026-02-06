@@ -1,7 +1,7 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
  * Универсальная версия с JSON структурой
- * ВЕРСИЯ: Автообновление данных с датчиков
+ * ВЕРСИЯ 2.3: Исправления интерфейса
  */
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -13,41 +13,60 @@
 const char* AP_SSID = "SmartHome-Hub";
 const char* AP_PASSWORD = "12345678";
 
-// MAC вашего узла (ESP32-C3)
+// MAC нашего основного узла (ESP32-C3)
 uint8_t nodeMacAddress[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
+// MAC устройства "Теплица"
+uint8_t greenhouseMac[] = {0xE8, 0x9F, 0x6D, 0x87, 0x34, 0x8A};
 
 // ---- 2. УНИВЕРСАЛЬНАЯ СТРУКТУРА ESP-NOW ----
 typedef struct esp_now_message {
-    char json[192];      // {"type":"sensor", "data":{...}} или {"type":"command", "command":"LED_ON"}
-    uint8_t sender_id;   // ID отправителя
+    char json[192];
+    uint8_t sender_id;
 } esp_now_message;
 
+// ---- 3. СТРУКТУРА ДАННЫХ ТЕПЛИЦЫ ----
+#pragma pack(push, 1)
+typedef struct greenhouse_packet {
+    char temp_in[4];
+    uint8_t reserved1[28];
+    char temp_out[4];
+    uint8_t reserved2[28];
+    uint32_t relay2_state;
+    uint32_t hum_in;
+    uint32_t broken_sensor1;
+    uint32_t broken_sensor2;
+    uint32_t relay1_state;
+} greenhouse_packet;
+#pragma pack(pop)
+
+// ---- 4. ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ----
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
 esp_now_message outgoingMessage;
 esp_now_message incomingMessage;
 
-// ---- 3. ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ----
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
+unsigned long lastGreenhouseUpdate = 0;
+const unsigned long GREENHOUSE_UPDATE_INTERVAL = 30000;
 
-// ---- 4. ПРОТОТИПЫ ФУНКЦИЙ ----
+// ---- 5. ПРОТОТИПЫ ----
 void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                      AwsEventType type, void *arg, uint8_t *data, size_t len);
 void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
 void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
 void sendToNode(String cmd);
 void broadcastWs(String type, String text, String state = "");
+void processGreenhouseData(const uint8_t *data);
+void processNodeData(const uint8_t *data, int len);
+String relayStateToString(uint32_t state);
 
 // ===================== SETUP =====================
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("\n=== SmartHome ESP-NOW Hub (JSON версия) ===");
-    Serial.println("=== РЕЖИМ: АВТООБНОВЛЕНИЕ ДАННЫХ ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 2.3) ===");
+    Serial.println("=== Исправления интерфейса ===");
 
-    // 1. WI-FI ТОЧКА ДОСТУПА
-    Serial.print("Запуск точки доступа: ");
-    Serial.println(AP_SSID);
     WiFi.mode(WIFI_AP);
     if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
         Serial.println("❌ Ошибка создания точки доступа!");
@@ -56,7 +75,6 @@ void setup() {
     Serial.print("IP адрес: ");
     Serial.println(WiFi.softAPIP());
 
-    // 2. WEB-СЕРВЕР И WEB SOCKET
     server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
         String html = R"rawliteral(
 <!DOCTYPE html>
@@ -64,120 +82,354 @@ void setup() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Умный дом ESP-NOW</title>
+    <title>Умный дом ESP-NOW + Теплица</title>
     <style>
-        body {font-family: Arial; text-align: center; margin-top: 30px;}
-        button {font-size: 20px; padding: 15px 30px; margin: 10px; border: none; border-radius: 8px; cursor: pointer;}
-        #btnOn {background: #4CAF50; color: white;}
-        #btnOff {background: #f44336; color: white;}
-        #btnStatus {background: #2196F3; color: white;}
-        #status {margin-top: 30px; font-size: 18px; padding: 15px; background: #f5f5f5; border-radius: 8px; min-height: 60px; text-align: left;}
-        .on {color: #4CAF50; font-weight: bold;}
-        .off {color: #f44336; font-weight: bold;}
-        .data {color: #FF9800;}
-        .sensor-row { display: flex; justify-content: space-between; margin: 5px 0; }
-        .sensor-label { font-weight: bold; }
-        .sensor-value { font-family: monospace; }
-        .gpio-status { color: #9C27B0; }
-        #lastUpdate { font-size: 0.9em; color: #666; margin-top: 10px; text-align: right; }
+        body {font-family: Arial; text-align: center; margin-top: 20px; max-width: 800px; margin-left: auto; margin-right: auto;}
+        h1 {color: #333;}
+        
+        /* КНОПКА ОБНОВИТЬ ДАННЫЕ */
+        #refreshBtn {
+            font-size: 14px;
+            padding: 10px 25px;
+            background: #3498db;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            margin: 20px auto;
+            display: block;
+            width: 250px;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+        #refreshBtn:hover {
+            background: #2980b9;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        
+        .section {
+            background: #f9f9f9;
+            border-radius: 12px;
+            padding: 20px;
+            margin: 25px 0;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            text-align: left;
+        }
+        .section-title {
+            font-size: 1.5em;
+            margin-bottom: 15px;
+            color: #2c3e50;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 8px;
+        }
+        .sensor-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 10px;
+        }
+        .sensor-item {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 5px solid #3498db;
+        }
+        .sensor-label {
+            font-weight: bold;
+            color: #555;
+            display: block;
+            margin-bottom: 5px;
+        }
+        .sensor-value {
+            font-size: 1.8em;
+            font-family: 'Courier New', monospace;
+            color: #2c3e50;
+        }
+        .sensor-unit {
+            font-size: 0.9em;
+            color: #7f8c8d;
+            margin-left: 3px;
+        }
+        .relay-status {
+            display: inline-block;
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-weight: bold;
+            margin-top: 5px;
+        }
+        .relay-on {
+            background-color: #27ae60;
+            color: white;
+        }
+        .relay-off {
+            background-color: #e74c3c;
+            color: white;
+        }
+        
+        /* КНОПКА LED (уменьшена и смещена влево) */
+        #ledToggleBtn {
+            font-size: 14px; /* Такой же размер как у "Обновить данные" */
+            padding: 10px 25px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            color: white;
+            font-weight: bold;
+            transition: all 0.3s;
+            width: 250px; /* Такая же ширина */
+            margin: 15px 0; /* Смещение влево */
+            float: left; /* Выравнивание по левому краю */
+            display: block;
+        }
+        #ledToggleBtn.led-on {
+            background: linear-gradient(135deg, #e74c3c, #c0392b);
+        }
+        #ledToggleBtn.led-off {
+            background: linear-gradient(135deg, #2ecc71, #27ae60);
+        }
+        #ledToggleBtn.led-unknown {
+            background: #95a5a6;
+            cursor: not-allowed;
+        }
+        #ledToggleBtn:disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+        }
+        #ledToggleBtn:not(:disabled):hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        
+        .control-buttons {
+            margin-top: 20px;
+            clear: both; /* Очистка обтекания */
+        }
+        
+        #lastUpdate {
+            font-size: 0.85em;
+            color: #95a5a6;
+            text-align: right;
+            margin-top: 15px;
+            font-style: italic;
+        }
+        .node-info {
+            color: #7f8c8d;
+            font-size: 0.9em;
+            margin-bottom: 10px;
+            clear: both; /* Чтобы текст не наезжал на кнопку */
+        }
+        #nodeSensorData { 
+            min-height: 100px; 
+            clear: both; /* Чтобы данные датчиков были под кнопкой */
+            margin-top: 10px;
+        }
     </style>
 </head>
 <body>
-    <h1>🏠 Умный дом ESP-NOW</h1>
-    <p>MAC узла: AC:EB:E6:49:10:28 | ID: 101 | <span id="connectionStatus">✅ Связь активна</span></p>
-    <button id="btnOn" onclick="sendCommand('LED_ON')">▶ ВКЛЮЧИТЬ LED</button>
-    <button id="btnOff" onclick="sendCommand('LED_OFF')">⏸ ВЫКЛЮЧИТЬ LED</button>
-    <button id="btnStatus" onclick="sendCommand('GET_STATUS')">🔄 ОБНОВИТЬ СЕЙЧАС</button>
+    <h1>🏠 Умный дом ESP-NOW + 🌿 Теплица</h1>
     
-    <div id="status">
-        <div>📊 <span class="data">Данные датчиков:</span></div>
-        <div id="sensorData">Ожидание данных от узла... Данные появятся здесь автоматически.</div>
-        <div id="lastUpdate">—</div>
+    <!-- КНОПКА ОБНОВИТЬ ДАННЫЕ -->
+    <button id="refreshBtn" onclick="sendCommand('GET_STATUS')">🔄 ОБНОВИТЬ ДАННЫЕ</button>
+
+    <!-- Секция основного узла -->
+    <div class="section">
+        <div class="section-title">📟 Основной узел (ID: 101)</div>
+        <div class="node-info">MAC: AC:EB:E6:49:10:28</div>
+        
+        <!-- КНОПКА LED (смещена влево, уменьшена) -->
+        <button id="ledToggleBtn" class="led-unknown" onclick="toggleLED()">--</button>
+        <div style="clear: both;"></div> <!-- Очистка обтекания -->
+        
+        <!-- БЛОК ДЛЯ ДАННЫХ ДАТЧИКОВ -->
+        <div id="nodeSensorData">
+            <p>Нажмите "Обновить данные" для получения показаний</p>
+        </div>
+    </div>
+
+    <!-- Секция теплицы -->
+    <div class="section">
+        <div class="section-title">🌿 Теплица (ID: 102)</div>
+        <div class="node-info">MAC: E8:9F:6D:87:34:8A | Данные обновляются каждые 30 сек.</div>
+        <div class="sensor-grid" id="greenhouseData">
+            <div class="sensor-item">
+                <span class="sensor-label">Температура (внутри):</span>
+                <span class="sensor-value">--</span><span class="sensor-unit">°C</span>
+            </div>
+            <div class="sensor-item">
+                <span class="sensor-label">Температура (улица):</span>
+                <span class="sensor-value">--</span><span class="sensor-unit">°C</span>
+            </div>
+            <div class="sensor-item">
+                <span class="sensor-label">Влажность (внутри):</span>
+                <span class="sensor-value">--</span><span class="sensor-unit">%</span>
+            </div>
+            <div class="sensor-item">
+                <span class="sensor-label">Реле 1 (основное):</span><br>
+                <span id="relay1State" class="relay-status relay-off">--</span>
+            </div>
+            <div class="sensor-item">
+                <span class="sensor-label">Реле 2 (доп.):</span><br>
+                <span id="relay2State" class="relay-status relay-off">--</span>
+            </div>
+        </div>
+        <div id="lastUpdate">Ожидание данных от теплицы...</div>
     </div>
 
     <script>
         const ws = new WebSocket('ws://' + window.location.hostname + '/ws');
-        let lastUpdateTime = null;
-        
+        let lastGreenhouseUpdate = null;
+        let ledState = 'unknown';
+        let buttonLocked = false;
+
         ws.onopen = function() {
             console.log('✅ WebSocket подключён');
-            document.getElementById('connectionStatus').textContent = '✅ Связь активна';
-            document.getElementById('sensorData').innerHTML = '<em>Ожидание первого пакета данных...</em>';
+            updateLEDButton();
+            setTimeout(() => {
+                if (ledState === 'unknown') {
+                    sendCommand('GET_STATUS');
+                }
+            }, 1000);
         };
-        
+
+        function updateLEDButton() {
+            const btn = document.getElementById('ledToggleBtn');
+            
+            if (ledState === 'on') {
+                btn.textContent = '⏸ ВЫКЛЮЧИТЬ LED';
+                btn.className = 'led-on';
+                btn.disabled = false;
+            } else if (ledState === 'off') {
+                btn.textContent = '▶ ВКЛЮЧИТЬ LED';
+                btn.className = 'led-off';
+                btn.disabled = false;
+            } else {
+                btn.textContent = '-- (статус неизвестен)';
+                btn.className = 'led-unknown';
+                btn.disabled = true;
+            }
+        }
+
+        function toggleLED() {
+            if (buttonLocked || ws.readyState !== WebSocket.OPEN) {
+                console.log('Кнопка заблокирована или нет связи');
+                return;
+            }
+            
+            const btn = document.getElementById('ledToggleBtn');
+            const newCmd = (ledState === 'on') ? 'LED_OFF' : 'LED_ON';
+            
+            console.log('Отправка команды:', newCmd, 'Текущее состояние:', ledState);
+            
+            buttonLocked = true;
+            btn.disabled = true;
+            btn.style.opacity = '0.7';
+            
+            setTimeout(() => {
+                if (buttonLocked) {
+                    console.log('Таймаут: подтверждение не получено');
+                    buttonLocked = false;
+                    updateLEDButton();
+                }
+            }, 5000);
+            
+            ws.send(JSON.stringify({command: newCmd}));
+        }
+
+        function sendCommand(cmd) {
+            if (ws.readyState !== WebSocket.OPEN) {
+                console.log('Нет связи с WebSocket');
+                return;
+            }
+            ws.send(JSON.stringify({command: cmd}));
+            console.log('Отправлена команда:', cmd);
+        }
+
         ws.onmessage = function(event) {
             const msg = JSON.parse(event.data);
-            console.log('Получено сообщение:', msg);
-            
-            if(msg.type === 'node_status') {
-                // Обновляем статус кнопок при ответе на команду
-                if(msg.state === 'on') {
-                    document.getElementById('btnOn').style.opacity = '0.6';
-                    document.getElementById('btnOff').style.opacity = '1';
-                } else {
-                    document.getElementById('btnOn').style.opacity = '1';
-                    document.getElementById('btnOff').style.opacity = '0.6';
-                }
-                // Можно показать всплывающее уведомление, но не обязательно
-                console.log('Статус узла:', msg.text);
+            console.log('Получено:', msg.type);
+
+            if (msg.type === 'node_status') {
+                console.log('Получен статус LED:', msg.state);
+                ledState = msg.state;
+                buttonLocked = false;
+                updateLEDButton();
             }
-            else if(msg.type === 'sensor_data') {
-                // ОСНОВНОЙ БЛОК: ОБНОВЛЯЕМ ДАННЫЕ ДАТЧИКОВ
-                let html = '';
-                if(msg.aht20) {
-                    html += '<div class="sensor-row"><span class="sensor-label">AHT20 (t):</span><span class="sensor-value">' + msg.aht20.temp + '°C</span></div>';
-                    html += '<div class="sensor-row"><span class="sensor-label">AHT20 (h):</span><span class="sensor-value">' + msg.aht20.hum + '%</span></div>';
+            else if (msg.type === 'sensor_data') {
+                // ТОЛЬКО данные датчиков, БЕЗ информации о GPIO
+                let html = '<div class="sensor-grid">';
+                if (msg.aht20) {
+                    html += `<div class="sensor-item"><span class="sensor-label">AHT20 (t):</span><span class="sensor-value">${msg.aht20.temp}</span><span class="sensor-unit">°C</span></div>`;
+                    html += `<div class="sensor-item"><span class="sensor-label">AHT20 (h):</span><span class="sensor-value">${msg.aht20.hum}</span><span class="sensor-unit">%</span></div>`;
                 }
-                if(msg.bmp280) {
-                    html += '<div class="sensor-row"><span class="sensor-label">BMP280 (t):</span><span class="sensor-value">' + msg.bmp280.temp + '°C</span></div>';
-                    html += '<div class="sensor-row"><span class="sensor-label">BMP280 (p):</span><span class="sensor-value">' + msg.bmp280.press + ' mmHg</span></div>';
+                if (msg.bmp280) {
+                    html += `<div class="sensor-item"><span class="sensor-label">BMP280 (t):</span><span class="sensor-value">${msg.bmp280.temp}</span><span class="sensor-unit">°C</span></div>`;
+                    html += `<div class="sensor-item"><span class="sensor-label">BMP280 (p):</span><span class="sensor-value">${msg.bmp280.press}</span><span class="sensor-unit">mmHg</span></div>`;
                 }
-                document.getElementById('sensorData').innerHTML = html;
+                html += '</div>';
+                document.getElementById('nodeSensorData').innerHTML = html;
                 
-                // Обновляем время последнего обновления
-                lastUpdateTime = new Date();
-                document.getElementById('lastUpdate').textContent = 'Обновлено: ' + lastUpdateTime.toLocaleTimeString();
-            }
-            else if(msg.type === 'gpio_status') {
-                // Обновляем статус светодиода, если нужно
-                let html = '🔌 <span class="gpio-status">Состояние GPIO:</span><br>';
-                if(msg.gpio8 !== undefined) {
-                    html += '<div class="sensor-row"><span class="sensor-label">GPIO8 (LED):</span><span class="sensor-value">' + (msg.gpio8 ? 'ВКЛ' : 'ВЫКЛ') + '</span></div>';
-                    document.getElementById('sensorData').innerHTML += html;
+                if (ledState === 'unknown') {
+                    sendCommand('GET_STATUS');
                 }
             }
-            else if(msg.type === 'hub_log') {
-                console.log('Хаб:', msg.text);
+            else if (msg.type === 'gpio_status') {
+                // ТОЛЬКО обновляем состояние LED, НЕ выводим блок GPIO
+                if (msg.gpio8 !== undefined) {
+                    ledState = msg.gpio8 ? 'on' : 'off';
+                    updateLEDButton();
+                    // НЕ добавляем HTML с информацией о GPIO
+                }
+            }
+            else if (msg.type === 'greenhouse_data') {
+                lastGreenhouseUpdate = new Date();
+                
+                const greenhouseData = document.querySelectorAll('#greenhouseData .sensor-value');
+                if (greenhouseData.length >= 3) {
+                    greenhouseData[0].textContent = msg.temp_in;
+                    greenhouseData[1].textContent = msg.temp_out;
+                    greenhouseData[2].textContent = msg.hum_in;
+                }
+                
+                // ОБНОВЛЯЕМ статусы реле КАЖДЫЙ раз при получении данных
+                updateRelayDisplay('relay1State', msg.relay1_state);
+                updateRelayDisplay('relay2State', msg.relay2_state);
+                
+                document.getElementById('lastUpdate').textContent = `Обновлено: ${lastGreenhouseUpdate.toLocaleTimeString()}`;
             }
         };
-        
-        ws.onclose = function() {
-            document.getElementById('connectionStatus').textContent = '❌ Связь потеряна';
-            document.getElementById('sensorData').innerHTML = '<em style="color: red;">Соединение с хабом разорвано. Перезагрузите страницу.</em>';
-        };
-        
-        function sendCommand(cmd) {
-            if(ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({command: cmd}));
-                console.log('Отправлена команда:', cmd);
+
+        function updateRelayDisplay(elementId, state) {
+            const element = document.getElementById(elementId);
+            if (state === 1 || state === '1') {
+                element.textContent = 'ВКЛЮЧЕНО';
+                element.className = 'relay-status relay-on';
+            } else {
+                element.textContent = 'ВЫКЛЮЧЕНО';
+                element.className = 'relay-status relay-off';
             }
         }
-        
-        // Функция для обновления времени "сколько секунд назад"
+
         function updateTimeAgo() {
-            if(lastUpdateTime) {
-                const secondsAgo = Math.floor((new Date() - lastUpdateTime) / 1000);
+            if (lastGreenhouseUpdate) {
+                const secondsAgo = Math.floor((new Date() - lastGreenhouseUpdate) / 1000);
                 const elem = document.getElementById('lastUpdate');
-                if(secondsAgo < 60) {
+                if (secondsAgo < 60) {
                     elem.textContent = `Обновлено: ${secondsAgo} сек. назад`;
                 } else {
-                    elem.textContent = `Обновлено: ${lastUpdateTime.toLocaleTimeString()}`;
+                    elem.textContent = `Обновлено: ${lastGreenhouseUpdate.toLocaleTimeString()}`;
                 }
             }
         }
         
-        // Запускаем таймер для обновления времени
         setInterval(updateTimeAgo, 1000);
+        updateLEDButton();
+
+        ws.onclose = function() {
+            console.log('WebSocket отключен');
+            ledState = 'unknown';
+            updateLEDButton();
+        };
     </script>
 </body>
 </html>
@@ -190,32 +442,39 @@ void setup() {
     server.begin();
     Serial.println("✅ Веб-сервер и WebSocket запущены.");
 
-    // 3. ИНИЦИАЛИЗАЦИЯ ESP-NOW
     WiFi.mode(WIFI_AP_STA);
     if (esp_now_init() != ESP_OK) {
         Serial.println("❌ Ошибка инициализации ESP-NOW!");
         while(1) delay(1000);
     }
 
-    // Регистрация колбэков
     esp_now_register_send_cb(onEspNowDataSent);
     esp_now_register_recv_cb(onEspNowDataRecv);
 
-    // Добавление узла как пира
     esp_now_peer_info_t peerInfo = {};
     memcpy(peerInfo.peer_addr, nodeMacAddress, 6);
     peerInfo.channel = 0;
     peerInfo.encrypt = false;
     if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-        Serial.println("❌ Не удалось добавить узел в ESP-NOW!");
+        Serial.println("❌ Не удалось добавить основной узел!");
     } else {
-        Serial.println("✅ Узел добавлен в ESP-NOW.");
+        Serial.println("✅ Основной узел добавлен.");
+    }
+
+    esp_now_peer_info_t greenhousePeerInfo = {};
+    memcpy(greenhousePeerInfo.peer_addr, greenhouseMac, 6);
+    greenhousePeerInfo.channel = 0;
+    greenhousePeerInfo.encrypt = false;
+    if (esp_now_add_peer(&greenhousePeerInfo) != ESP_OK) {
+        Serial.println("❌ Не удалось добавить теплицу!");
+    } else {
+        Serial.println("✅ Теплица добавлена.");
     }
 
     Serial.println("\n=== ХАБ ГОТОВ К РАБОТЕ ===");
     Serial.println("1. Подключитесь к Wi-Fi: " + String(AP_SSID));
-    Serial.println("2. Откройте в браузере: http://" + WiFi.softAPIP().toString());
-    Serial.println("3. Данные с датчиков будут обновляться автоматически каждые 30 сек.\n");
+    Serial.println("2. Откройте: http://" + WiFi.softAPIP().toString());
+    Serial.println("3. Кнопка LED: цвет меняется после подтверждения\n");
 }
 
 void loop() {
@@ -223,7 +482,6 @@ void loop() {
     delay(10);
 }
 
-// ===================== WEB SOCKET ОБРАБОТЧИК =====================
 void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                      AwsEventType type, void *arg, uint8_t *data, size_t len) {
     if (type == WS_EVT_DATA) {
@@ -238,54 +496,72 @@ void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
     }
 }
 
-// ===================== ОТПРАВКА НА УЗЕЛ =====================
 void sendToNode(String cmd) {
-    // Формируем JSON команды
     char json_cmd[64];
     snprintf(json_cmd, sizeof(json_cmd), "{\"type\":\"command\",\"command\":\"%s\"}", cmd.c_str());
-    
+
     strncpy(outgoingMessage.json, json_cmd, sizeof(outgoingMessage.json)-1);
     outgoingMessage.json[sizeof(outgoingMessage.json)-1] = '\0';
-    outgoingMessage.sender_id = 1; // ID хаба
-    
+    outgoingMessage.sender_id = 1;
+
     esp_err_t result = esp_now_send(nodeMacAddress, (uint8_t *) &outgoingMessage, sizeof(outgoingMessage));
-    
+
     if (result == ESP_OK) {
-        Serial.print("📡 Отправлена команда: ");
+        Serial.print("📡 Отправлена команда на узел: ");
         Serial.println(cmd);
-        broadcastWs("hub_log", "Команда '" + cmd + "' отправлена на узел", "");
     } else {
         Serial.print("❌ Ошибка отправки: ");
         Serial.println(result);
     }
 }
 
-// ===================== ESP-NOW КОЛБЭКИ =====================
 void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-    Serial.print("✉️ Доставка ESP-NOW: ");
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+    Serial.printf("✉️ Доставка для %s: ", macStr);
     Serial.println(status == ESP_NOW_SEND_SUCCESS ? "✅ Успех" : "❌ Ошибка");
 }
 
 void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
-    // --- ФИЛЬТР: Принимаем данные ТОЛЬКО от нашего узла ---
-    uint8_t allowedNodeMac[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
-    if (memcmp(mac_addr, allowedNodeMac, 6) != 0) {
-        char macStr[18];
-        snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-                 mac_addr[0], mac_addr[1], mac_addr[2],
-                 mac_addr[3], mac_addr[4], mac_addr[5]);
-        Serial.print("[ХАБ] Игнорирую чужой узел: ");
-        Serial.println(macStr);
+    char macStr[18];
+    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+
+    uint8_t nodeMac[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
+    if (memcmp(mac_addr, nodeMac, 6) == 0) {
+        Serial.printf("\n📥 Пакет от основного узла (%s), длина: %d байт\n", macStr, len);
+        processNodeData(incomingData, len);
         return;
     }
-    // --- КОНЕЦ ФИЛЬТРА ---
 
-    memcpy(&incomingMessage, incomingData, sizeof(incomingMessage));
+    uint8_t greenhouseMac[] = {0xE8, 0x9F, 0x6D, 0x87, 0x34, 0x8A};
+    if (memcmp(mac_addr, greenhouseMac, 6) == 0) {
+        Serial.printf("\n🌿 Пакет от теплицы (%s), длина: %d байт\n", macStr, len);
+        
+        if (len == sizeof(greenhouse_packet)) {
+            processGreenhouseData(incomingData);
+        } else {
+            Serial.printf("❌ Неожиданная длина пакета! Ожидалось %d, получено %d\n", 
+                         sizeof(greenhouse_packet), len);
+        }
+        return;
+    }
+
+    Serial.printf("[ХАБ] Игнорирую неизвестное устройство: %s\n", macStr);
+}
+
+void processNodeData(const uint8_t *data, int len) {
+    if (len <= sizeof(incomingMessage)) {
+        memcpy(&incomingMessage, data, len);
+    } else {
+        Serial.println("❌ Пакет от узла слишком большой!");
+        return;
+    }
     
     Serial.print("📥 JSON от узла: ");
     Serial.println(incomingMessage.json);
 
-    // Парсим JSON от узла
     StaticJsonDocument<256> doc;
     DeserializationError error = deserializeJson(doc, incomingMessage.json);
     
@@ -298,19 +574,17 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
     const char* type = doc["type"];
     
     if (strcmp(type, "sensor") == 0) {
-        // ✅ ОСНОВНОЕ ИЗМЕНЕНИЕ: ВСЕГДА отправляем данные в веб-интерфейс
-        // Данные датчиков пришли (автоматически или по запросу)
-        JsonObject data = doc["data"];
+        JsonObject dataObj = doc["data"];
         StaticJsonDocument<300> response;
         response["type"] = "sensor_data";
         
-        if (data.containsKey("AHT20")) {
-            response["aht20"]["temp"] = data["AHT20"]["temp"].as<String>();
-            response["aht20"]["hum"] = data["AHT20"]["hum"].as<String>();
+        if (dataObj.containsKey("AHT20")) {
+            response["aht20"]["temp"] = dataObj["AHT20"]["temp"].as<String>();
+            response["aht20"]["hum"] = dataObj["AHT20"]["hum"].as<String>();
         }
-        if (data.containsKey("BMP280")) {
-            response["bmp280"]["temp"] = data["BMP280"]["temp"].as<String>();
-            response["bmp280"]["press"] = data["BMP280"]["press_mmHg"].as<String>();
+        if (dataObj.containsKey("BMP280")) {
+            response["bmp280"]["temp"] = dataObj["BMP280"]["temp"].as<String>();
+            response["bmp280"]["press"] = dataObj["BMP280"]["press_mmHg"].as<String>();
         }
         
         String jsonResponse;
@@ -319,8 +593,11 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
         Serial.println("📊 Данные с датчиков отправлены в веб-интерфейс.");
     }
     else if (strcmp(type, "ack") == 0) {
-        // Подтверждение команд
         const char* cmd = doc["command"];
+        const char* status = doc["status"];
+        
+        Serial.printf("✅ Подтверждение от узла: команда '%s', статус '%s'\n", cmd, status);
+        
         if (strcmp(cmd, "LED_ON") == 0) {
             broadcastWs("node_status", "LED на узле ВКЛЮЧЁН", "on");
         }
@@ -329,7 +606,7 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
         }
     }
     else if (strcmp(type, "gpio") == 0) {
-        // Состояние GPIO
+        // Отправляем только данные о состоянии GPIO для обновления кнопки
         StaticJsonDocument<200> response;
         response["type"] = "gpio_status";
         
@@ -347,7 +624,46 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
     }
 }
 
-// ===================== ОТПРАВКА В WEB SOCKET =====================
+void processGreenhouseData(const uint8_t *data) {
+    greenhouse_packet packet;
+    memcpy(&packet, data, sizeof(greenhouse_packet));
+
+    unsigned long now = millis();
+    if (now - lastGreenhouseUpdate < GREENHOUSE_UPDATE_INTERVAL) {
+        Serial.println("⚠️  Данные теплицы не отправлены в веб (частое обновление)");
+        return;
+    }
+    lastGreenhouseUpdate = now;
+
+    char temp_in_str[5] = {0};
+    char temp_out_str[5] = {0};
+    strncpy(temp_in_str, packet.temp_in, 4);
+    strncpy(temp_out_str, packet.temp_out, 4);
+
+    StaticJsonDocument<300> response;
+    response["type"] = "greenhouse_data";
+    response["temp_in"] = temp_in_str;
+    response["temp_out"] = temp_out_str;
+    response["hum_in"] = packet.hum_in;
+    response["relay1_state"] = packet.relay1_state;
+    response["relay2_state"] = packet.relay2_state;
+
+    String jsonResponse;
+    serializeJson(response, jsonResponse);
+    ws.textAll(jsonResponse);
+
+    Serial.println("✅ Данные теплицы обработаны и отправлены в веб:");
+    Serial.printf("   Температура внутри: %s °C\n", temp_in_str);
+    Serial.printf("   Температура улица:  %s °C\n", temp_out_str);
+    Serial.printf("   Влажность внутри:   %u %%\n", packet.hum_in);
+    Serial.printf("   Реле 1:             %s\n", relayStateToString(packet.relay1_state).c_str());
+    Serial.printf("   Реле 2:             %s\n", relayStateToString(packet.relay2_state).c_str());
+}
+
+String relayStateToString(uint32_t state) {
+    return (state == 1) ? "ВКЛЮЧЕНО" : "ВЫКЛЮЧЕНО";
+}
+
 void broadcastWs(String type, String text, String state) {
     StaticJsonDocument<200> doc;
     doc["type"] = type;

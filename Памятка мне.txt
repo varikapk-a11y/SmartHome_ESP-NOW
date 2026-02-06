@@ -1,0 +1,9 @@
+CHAT_TRANSITION.md — Контекст для продолжения чата
+
+DEVELOPMENT_SETUP.md — Инструкция по настройке среды
+
+PROJECT_BASELINE.md — Паспорт проекта (версии, состояние)
+
+README.md — Обзор документации
+
+ROADMAP.md — План развития
