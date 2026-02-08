@@ -1,6 +1,6 @@
 /**
- * SmartHome ESP-NOW Узел (ESP32-C3)
- * Универсальная версия с JSON структурой
+ * SmartHome ESP-NOW Узел (ESP32-C3) с охраной
+ * Универсальная версия с JSON структурой и концевиками
  */
 #include <Arduino.h>
 #include <WiFi.h>
@@ -9,12 +9,15 @@
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BMP280.h>
 #include <Adafruit_AHTX0.h>
-#include <ArduinoJson.h> // <--- ДОБАВЬТЕ ЭТУ СТРОКУ
+#include <ArduinoJson.h>
 
 // ---- КОНСТАНТЫ ----
 #define NODE_ID 101
 #define LED_PIN 8
+#define CONTACT1_PIN 3    // GPIO для концевика 1 (НОРМАЛЬНО ЗАМКНУТ)
+#define CONTACT2_PIN 4    // GPIO для концевика 2 (НОРМАЛЬНО ЗАМКНУТ)
 #define SENSOR_READ_INTERVAL 30000 // 30 сек
+#define SECURITY_CHECK_INTERVAL 2000 // 2 сек - проверка концевиков
 
 // I2C пины для ESP32-C3
 const int SDA_PIN = 1;
@@ -34,6 +37,9 @@ bool hasAHT = false;
 esp_now_message incomingMessage;
 esp_now_message outgoingMessage;
 unsigned long lastSensorReadTime = 0;
+unsigned long lastSecurityCheck = 0;
+bool lastContact1Alarm = false;   // false = норма (замкнут), true = тревога (разомкнут)
+bool lastContact2Alarm = false;   // false = норма (замкнут), true = тревога (разомкнут)
 
 // MAC хаба
 uint8_t hubMacAddress[] = {0x9C, 0x9C, 0x1F, 0xC7, 0x2D, 0x94};
@@ -45,17 +51,27 @@ void sendJsonToHub(const char* json_string);
 void readAndSendSensorData();
 void sendGpioStatus();
 bool initSensors();
+void checkSecuritySensors();
+void sendSecurityStatus(bool contact1Alarm, bool contact2Alarm);
 
 // ===================== SETUP =====================
 void setup() {
     Serial.begin(115200);
     delay(3000);
 
-    Serial.println("\n=== УЗЕЛ ESP-NOW (JSON версия) ===");
+    Serial.println("\n=== УЗЕЛ ESP-NOW (JSON версия с охраной) ===");
     Serial.println("MAC: AC:EB:E6:49:10:28 | ID: 101");
+    Serial.println("Концевики: GPIO3 и GPIO4 (тревога при РАЗРЫВЕ цепи)");
 
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, HIGH);
+
+    // Инициализация концевиков (INPUT_PULLUP - нормально замкнутая цепь)
+    // При замыкании на GND: пин = LOW = норма
+    // При разрыве цепи: пин = HIGH = тревога (через внутреннюю подтяжку)
+    pinMode(CONTACT1_PIN, INPUT_PULLUP);
+    pinMode(CONTACT2_PIN, INPUT_PULLUP);
+    Serial.println("[0] Концевики инициализированы (INPUT_PULLUP, нормально-замкнутые)");
 
     // I2C
     Wire.begin(SDA_PIN, SCL_PIN);
@@ -92,19 +108,44 @@ void setup() {
         Serial.println("[5] Хаб добавлен как пир.");
     }
 
+    // Первоначальная проверка концевиков
+    // При замыкании на GND: digitalRead() = LOW (0) = норма
+    // При разрыве цепи: digitalRead() = HIGH (1) = тревога
+    lastContact1Alarm = (digitalRead(CONTACT1_PIN) == HIGH);
+    lastContact2Alarm = (digitalRead(CONTACT2_PIN) == HIGH);
+    
+    Serial.print("[ОХРАНА] Начальное состояние: ");
+    Serial.print("Концевик1=");
+    Serial.print(lastContact1Alarm ? "ТРЕВОГА (разомкнут)" : "НОРМА (замкнут)");
+    Serial.print(", Концевик2=");
+    Serial.println(lastContact2Alarm ? "ТРЕВОГА (разомкнут)" : "НОРМА (замкнут)");
+
+    // Отправка начального статуса на хаб
+    sendSecurityStatus(lastContact1Alarm, lastContact2Alarm);
+
     Serial.println("\n=== УЗЕЛ ГОТОВ К РАБОТЕ ===\n");
     readAndSendSensorData();
     lastSensorReadTime = millis();
+    lastSecurityCheck = millis();
 }
 
 // ===================== LOOP =====================
 void loop() {
     unsigned long now = millis();
+    
+    // Проверка датчиков каждые 30 секунд
     if (now - lastSensorReadTime >= SENSOR_READ_INTERVAL) {
         readAndSendSensorData();
         lastSensorReadTime = now;
     }
-    delay(1000);
+    
+    // Проверка концевиков каждые 2 секунды
+    if (now - lastSecurityCheck >= SECURITY_CHECK_INTERVAL) {
+        checkSecuritySensors();
+        lastSecurityCheck = now;
+    }
+    
+    delay(100);
 }
 
 // ===================== ФУНКЦИИ =====================
@@ -179,7 +220,7 @@ void readAndSendSensorData() {
     sendJsonToHub(json);
 }
 
-// ОТПРАВКА СОСТОЯНИЯ GPIO
+// ОТПРАВКА СОСТОЯНИЯ GPIO (LED)
 void sendGpioStatus() {
     char json[64];
     snprintf(json, sizeof(json),
@@ -187,6 +228,42 @@ void sendGpioStatus() {
         digitalRead(LED_PIN) == LOW ? 1 : 0);
     
     Serial.print("[GPIO] Отправка: ");
+    Serial.println(json);
+    sendJsonToHub(json);
+}
+
+// ПРОВЕРКА СОСТОЯНИЯ КОНЦЕВИКОВ
+void checkSecuritySensors() {
+    // С PULLUP: LOW = цепь замкнута (норма), HIGH = цепь разорвана (тревога)
+    bool currentContact1Alarm = (digitalRead(CONTACT1_PIN) == HIGH);
+    bool currentContact2Alarm = (digitalRead(CONTACT2_PIN) == HIGH);
+    
+    // Если состояние изменилось - отправляем уведомление
+    if (currentContact1Alarm != lastContact1Alarm || currentContact2Alarm != lastContact2Alarm) {
+        Serial.print("[ОХРАНА] Изменение: ");
+        Serial.print("Концевик1=");
+        Serial.print(currentContact1Alarm ? "ТРЕВОГА (разомкнут)" : "НОРМА (замкнут)");
+        Serial.print(", Концевик2=");
+        Serial.print(currentContact2Alarm ? "ТРЕВОГА (разомкнут)" : "НОРМА (замкнут)");
+        Serial.println(" | Отправка на хаб...");
+        
+        sendSecurityStatus(currentContact1Alarm, currentContact2Alarm);
+        
+        lastContact1Alarm = currentContact1Alarm;
+        lastContact2Alarm = currentContact2Alarm;
+    }
+}
+
+// ОТПРАВКА СТАТУСА ОХРАНЫ
+void sendSecurityStatus(bool contact1Alarm, bool contact2Alarm) {
+    char json[128];
+    snprintf(json, sizeof(json),
+        "{\"type\":\"security\",\"alarm\":%s,\"contact1\":%s,\"contact2\":%s}",
+        (contact1Alarm || contact2Alarm) ? "true" : "false",
+        contact1Alarm ? "true" : "false",
+        contact2Alarm ? "true" : "false");
+    
+    Serial.print("[ОХРАНА] Отправка: ");
     Serial.println(json);
     sendJsonToHub(json);
 }
@@ -240,6 +317,10 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
             Serial.println("  -> 📡 Запрос данных...");
             readAndSendSensorData();
             sendGpioStatus();
+            // При запросе статуса также отправляем состояние охраны
+            bool contact1Alarm = (digitalRead(CONTACT1_PIN) == HIGH);
+            bool contact2Alarm = (digitalRead(CONTACT2_PIN) == HIGH);
+            sendSecurityStatus(contact1Alarm, contact2Alarm);
         }
     }
 }
