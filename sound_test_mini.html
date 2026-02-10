@@ -1,0 +1,110 @@
+<!-- Блок тестирования звука -->
+<div style="padding: 20px; background: #e8f4fd; border-radius: 8px; margin-top: 20px;">
+    <h3>🔊 Тест звуковых схем (Android 10)</h3>
+    <p><strong>Рабочие схемы:</strong></p>
+    <ul>
+        <li><strong>playBeep</strong> — короткий сигнал (800 Гц, 500мс).</li>
+        <li><strong>playAlarmTone</strong> — сирена тревоги (цикл 800/1200 Гц).</li>
+    </ul>
+
+    <div style="margin: 15px 0;">
+        <button onclick="testPlayBeep()" style="padding: 12px 25px; background: #3498db; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; margin-right: 10px;">
+            ▶ Запустить Короткий Сигнал (Beep)
+        </button>
+        <button onclick="testPlayAlarm()" style="padding: 12px 25px; background: #e74c3c; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer;">
+            🚨 Запустить Сирену Тревоги (Alarm)
+        </button>
+        <button onclick="stopAlarmTone()" style="padding: 12px 25px; background: #95a5a6; color: white; border: none; border-radius: 5px; font-size: 16px; cursor: pointer; margin-left: 10px;">
+            ⏹ Остановить Сирену
+        </button>
+    </div>
+</div>
+
+<script>
+// ====================== МЕНЕДЖЕР АУДИО ======================
+let audioContext = null;
+let alarmInterval = null;
+let isAlarmPlaying = false;
+
+// 1. Инициализация аудио при первом клике
+function initAudioOnFirstTouch() {
+    if (!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        console.log('AudioContext инициализирован');
+        document.removeEventListener('click', initAudioOnFirstTouch);
+        document.removeEventListener('touchstart', initAudioOnFirstTouch);
+    }
+}
+document.addEventListener('click', initAudioOnFirstTouch);
+document.addEventListener('touchstart', initAudioOnFirstTouch);
+
+// 2. КОРОТКИЙ СИГНАЛ (Beep) - из теста 4
+function playBeep() {
+    if (!audioContext) initAudioOnFirstTouch();
+    try {
+        const oscillator = audioContext.createOscillator();
+        const gainNode = audioContext.createGain();
+        oscillator.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+        oscillator.frequency.value = 800;
+        oscillator.type = 'sine';
+        gainNode.gain.value = 0.3;
+        oscillator.start();
+        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+        oscillator.stop(audioContext.currentTime + 0.5);
+    } catch(e) {
+        console.log('Ошибка воспроизведения beep:', e);
+    }
+}
+
+// 3. СИРЕНА ТРЕВОГИ (Alarm) - из теста "Сирена B"
+function playAlarmTone() {
+    if (isAlarmPlaying) return;
+    if (!audioContext) initAudioOnFirstTouch();
+    try {
+        isAlarmPlaying = true;
+        function playAlarmPulse(freq, duration) {
+            if (!audioContext) return;
+            const oscillator = audioContext.createOscillator();
+            const gainNode = audioContext.createGain();
+            oscillator.connect(gainNode);
+            gainNode.connect(audioContext.destination);
+            oscillator.frequency.value = freq;
+            oscillator.type = 'sawtooth';
+            gainNode.gain.value = 0.15;
+            oscillator.start();
+            gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + duration);
+            oscillator.stop(audioContext.currentTime + duration);
+        }
+        alarmInterval = setInterval(() => {
+            playAlarmPulse(800, 0.1);
+            setTimeout(() => { playAlarmPulse(1200, 0.1); }, 150);
+        }, 500);
+        console.log('Сирена активирована');
+    } catch(e) {
+        console.log('Ошибка запуска сирены:', e);
+        isAlarmPlaying = false;
+    }
+}
+
+// 4. ОСТАНОВКА СИРЕНЫ
+function stopAlarmTone() {
+    if (!isAlarmPlaying) return;
+    isAlarmPlaying = false;
+    if (alarmInterval) {
+        clearInterval(alarmInterval);
+        alarmInterval = null;
+    }
+    console.log('Сирена остановлена');
+}
+
+// 5. Функции для кнопок тестирования
+function testPlayBeep() {
+    playBeep();
+    console.log('Тест: Запущен короткий сигнал');
+}
+function testPlayAlarm() {
+    playAlarmTone();
+    console.log('Тест: Запущена сирена');
+}
+</script>
