@@ -1,7 +1,7 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
  * Универсальная версия с JSON структурой
- * ВЕРСИЯ 2.3: Исправления интерфейса
+ * ВЕРСИЯ 2.4: Добавлен статус охраны
  */
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -64,8 +64,8 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 2.3) ===");
-    Serial.println("=== Исправления интерфейса ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 2.4) ===");
+    Serial.println("=== Добавлен статус охраны ===");
 
     WiFi.mode(WIFI_AP);
     if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
@@ -201,6 +201,30 @@ void setup() {
             box-shadow: 0 4px 8px rgba(0,0,0,0.1);
         }
         
+        /* СТАТУС ОХРАНЫ */
+        .security-status {
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 15px;
+            text-align: center;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+        .security-normal {
+            background: linear-gradient(135deg, #27ae60, #2ecc71);
+            color: white;
+        }
+        .security-alarm {
+            background: linear-gradient(135deg, #e74c3c, #c0392b);
+            color: white;
+            animation: alarm-pulse 1s infinite;
+        }
+        @keyframes alarm-pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+        
         .control-buttons {
             margin-top: 20px;
             clear: both; /* Очистка обтекания */
@@ -236,6 +260,11 @@ void setup() {
     <div class="section">
         <div class="section-title">📟 Основной узел (ID: 101)</div>
         <div class="node-info">MAC: AC:EB:E6:49:10:28</div>
+        
+        <!-- СТАТУС ОХРАНЫ -->
+        <div id="securityStatus" class="security-status security-normal">
+            🔒 ОХРАНА: НОРМА (концевики замкнуты)
+        </div>
         
         <!-- КНОПКА LED (смещена влево, уменьшена) -->
         <button id="ledToggleBtn" class="led-unknown" onclick="toggleLED()">--</button>
@@ -373,6 +402,11 @@ void setup() {
                     sendCommand('GET_STATUS');
                 }
             }
+            else if (msg.type === 'security') {
+                // ОБРАБОТКА СТАТУСА ОХРАНЫ
+                console.log('Статус охраны:', msg.alarm);
+                updateSecurityStatus(msg.alarm, msg.contact1, msg.contact2);
+            }
             else if (msg.type === 'gpio_status') {
                 // ТОЛЬКО обновляем состояние LED, НЕ выводим блок GPIO
                 if (msg.gpio8 !== undefined) {
@@ -398,6 +432,32 @@ void setup() {
                 document.getElementById('lastUpdate').textContent = `Обновлено: ${lastGreenhouseUpdate.toLocaleTimeString()}`;
             }
         };
+
+        function updateSecurityStatus(alarm, contact1, contact2) {
+            const securityElement = document.getElementById('securityStatus');
+            
+            if (alarm) {
+                securityElement.className = 'security-status security-alarm';
+                let statusText = '🚨 ТРЕВОГА! ';
+                if (contact1 && contact2) {
+                    statusText += 'ОБА КОНЦЕВИКА РАЗОРВАНЫ!';
+                } else if (contact1) {
+                    statusText += 'Концевик 1 разорван';
+                } else if (contact2) {
+                    statusText += 'Концевик 2 разорван';
+                } else {
+                    statusText += 'Неизвестное состояние';
+                }
+                securityElement.innerHTML = statusText;
+            } else {
+                securityElement.className = 'security-status security-normal';
+                let statusText = '🔒 ОХРАНА: НОРМА';
+                if (contact1 !== undefined && contact2 !== undefined) {
+                    statusText += ` (концевик 1: ${contact1 ? 'разомкнут' : 'замкнут'}, концевик 2: ${contact2 ? 'разомкнут' : 'замкнут'})`;
+                }
+                securityElement.innerHTML = statusText;
+            }
+        }
 
         function updateRelayDisplay(elementId, state) {
             const element = document.getElementById(elementId);
@@ -591,6 +651,25 @@ void processNodeData(const uint8_t *data, int len) {
         serializeJson(response, jsonResponse);
         ws.textAll(jsonResponse);
         Serial.println("📊 Данные с датчиков отправлены в веб-интерфейс.");
+    }
+    else if (strcmp(type, "security") == 0) {
+        // ОБРАБОТКА СТАТУСА ОХРАНЫ
+        bool alarm = doc["alarm"];
+        bool contact1 = doc["contact1"];
+        bool contact2 = doc["contact2"];
+        
+        StaticJsonDocument<200> response;
+        response["type"] = "security";
+        response["alarm"] = alarm;
+        response["contact1"] = contact1;
+        response["contact2"] = contact2;
+        
+        String jsonResponse;
+        serializeJson(response, jsonResponse);
+        ws.textAll(jsonResponse);
+        
+        Serial.printf("🚨 Статус охраны: alarm=%d, contact1=%d, contact2=%d\n", 
+                     alarm, contact1, contact2);
     }
     else if (strcmp(type, "ack") == 0) {
         const char* cmd = doc["command"];
