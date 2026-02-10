@@ -1,7 +1,7 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
  * Универсальная версия с JSON структурой
- * ВЕРСИЯ 2.5: Контроль связи + звуковая сигнализация охраны
+ * ВЕРСИЯ 2.6: Контроль связи с цветовой индикацией + короткий звук
  */
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -51,6 +51,11 @@ unsigned long lastGreenhouseUpdate = 0;
 const unsigned long NODE_TIMEOUT_MS = 70000;  // 2 сеанса связи + запас (35 сек * 2)
 const unsigned long GREENHOUSE_UPDATE_INTERVAL = 30000;
 
+// Флаги контроля связи
+bool nodeConnectionLost = false;      // Флаг потери связи с узлом
+unsigned long connectionLostTime = 0; // Время потери связи
+const unsigned long CONNECTION_LOST_COOLDOWN = 10000; // 10 сек до следующего звукового сигнала
+
 // Флаг тревоги для звука
 bool securityAlarmActive = false;
 unsigned long alarmStartTime = 0;
@@ -67,16 +72,16 @@ void processGreenhouseData(const uint8_t *data);
 void processNodeData(const uint8_t *data, int len);
 String relayStateToString(uint32_t state);
 void checkNodeConnection();
-void clearNodeDataOnWeb();
 void updateAlarmState();
+void sendConnectionStatusToWeb(bool connected); // Новая функция
 
 // ===================== SETUP =====================
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 2.5) ===");
-    Serial.println("=== Контроль связи + звуковая сигнализация ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 2.6) ===");
+    Serial.println("=== Контроль связи + цветовая индикация + короткий звук ===");
 
     WiFi.mode(WIFI_AP);
     if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
@@ -145,6 +150,7 @@ void setup() {
             padding: 15px;
             border-radius: 8px;
             border-left: 5px solid #3498db;
+            transition: all 0.3s;
         }
         .sensor-label {
             font-weight: bold;
@@ -156,18 +162,34 @@ void setup() {
             font-size: 1.8em;
             font-family: 'Courier New', monospace;
             color: #2c3e50;
+            transition: all 0.3s;
         }
         .sensor-unit {
             font-size: 0.9em;
             color: #7f8c8d;
             margin-left: 3px;
         }
+        
+        /* СТИЛИ ДЛЯ УСТАРЕВШИХ ДАННЫХ */
+        .sensor-item.stale-data {
+            border-left: 5px solid #e74c3c !important;
+            opacity: 0.7;
+        }
+        .sensor-value.stale-data {
+            color: #e74c3c !important;
+        }
+        .data-stale {
+            color: #e74c3c !important;
+            opacity: 0.7;
+        }
+        
         .relay-status {
             display: inline-block;
             padding: 5px 12px;
             border-radius: 20px;
             font-weight: bold;
             margin-top: 5px;
+            transition: all 0.3s;
         }
         .relay-on {
             background-color: #27ae60;
@@ -180,7 +202,7 @@ void setup() {
         
         /* КНОПКА LED (уменьшена и смещена влево) */
         #ledToggleBtn {
-            font-size: 14px; /* Такой же размер как у "Обновить данные" */
+            font-size: 14px;
             padding: 10px 25px;
             border: none;
             border-radius: 8px;
@@ -188,9 +210,9 @@ void setup() {
             color: white;
             font-weight: bold;
             transition: all 0.3s;
-            width: 250px; /* Такая же ширина */
-            margin: 15px 0; /* Смещение влево */
-            float: left; /* Выравнивание по левому краю */
+            width: 250px;
+            margin: 15px 0;
+            float: left;
             display: block;
         }
         #ledToggleBtn.led-on {
@@ -236,6 +258,7 @@ void setup() {
             margin-top: 10px;
             text-align: center;
             font-weight: bold;
+            transition: all 0.3s;
         }
         .connection-ok {
             background: linear-gradient(135deg, #27ae60, #2ecc71);
@@ -259,7 +282,7 @@ void setup() {
         
         .control-buttons {
             margin-top: 20px;
-            clear: both; /* Очистка обтекания */
+            clear: both;
         }
         
         #lastUpdate {
@@ -273,11 +296,11 @@ void setup() {
             color: #7f8c8d;
             font-size: 0.9em;
             margin-bottom: 10px;
-            clear: both; /* Чтобы текст не наезжал на кнопку */
+            clear: both;
         }
         #nodeSensorData { 
             min-height: 100px; 
-            clear: both; /* Чтобы данные датчиков были под кнопкой */
+            clear: both;
             margin-top: 10px;
         }
     </style>
@@ -305,7 +328,7 @@ void setup() {
         
         <!-- КНОПКА LED (смещена влево, уменьшена) -->
         <button id="ledToggleBtn" class="led-unknown" onclick="toggleLED()">--</button>
-        <div style="clear: both;"></div> <!-- Очистка обтекания -->
+        <div style="clear: both;"></div>
         
         <!-- БЛОК ДЛЯ ДАННЫХ ДАТЧИКОВ -->
         <div id="nodeSensorData">
@@ -349,10 +372,12 @@ void setup() {
         let buttonLocked = false;
         let nodeConnectionActive = true;
         let connectionCheckInterval = null;
+        let nodeDataStale = false; // Флаг устаревания данных
 
-        // ================== АУДИО ДЛЯ ТРЕВОГИ ==================
+        // ================== АУДИО ДЛЯ ТРЕВОГИ И КОРОТКИХ СИГНАЛОВ ==================
         let audioContext = null;
         let alarmInterval = null;
+        let shortBeepTimer = null;
         let isAlarmPlaying = false;
         let alarmTimer = null;
 
@@ -368,7 +393,7 @@ void setup() {
         document.addEventListener('click', initAudioOnFirstTouch);
         document.addEventListener('touchstart', initAudioOnFirstTouch);
 
-        // 2. СИРЕНА ТРЕВОГИ
+        // 2. СИРЕНА ТРЕВОГИ (10 секунд для охраны)
         function playAlarmTone() {
             if (isAlarmPlaying) return;
             if (!audioContext) initAudioOnFirstTouch();
@@ -423,6 +448,36 @@ void setup() {
             console.log('Сирена остановлена');
         }
 
+        // 4. КОРОТКИЙ СИГНАЛ (2 секунды для потери связи)
+        function playShortBeep() {
+            if (!audioContext) initAudioOnFirstTouch();
+            
+            try {
+                console.log('Воспроизведение короткого сигнала (2 секунды)');
+                
+                function playBeep(freq, duration) {
+                    if (!audioContext) return;
+                    const oscillator = audioContext.createOscillator();
+                    const gainNode = audioContext.createGain();
+                    oscillator.connect(gainNode);
+                    gainNode.connect(audioContext.destination);
+                    oscillator.frequency.value = freq;
+                    oscillator.type = 'sawtooth';
+                    gainNode.gain.value = 0.1;
+                    oscillator.start();
+                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + duration);
+                    oscillator.stop(audioContext.currentTime + duration);
+                }
+                
+                // 2 коротких гудка
+                playBeep(600, 0.2);
+                setTimeout(() => { playBeep(400, 0.3); }, 300);
+                
+            } catch(e) {
+                console.log('Ошибка воспроизведения короткого сигнала:', e);
+            }
+        }
+
         // ================== ОСНОВНАЯ ЛОГИКА ==================
         ws.onopen = function() {
             console.log('✅ WebSocket подключён');
@@ -435,7 +490,7 @@ void setup() {
                     console.log('Проверка связи с узлом...');
                     sendCommand('GET_STATUS');
                 }
-            }, 70000); // 70 секунд
+            }, 70000);
         };
 
         function updateLEDButton() {
@@ -498,6 +553,7 @@ void setup() {
                 '<p style="color:#e74c3c;">⏳ Запрос данных отправлен. Ожидание ответа...</p>';
         }
 
+        // ОБНОВЛЕНИЕ СТАТУСА СОЕДИНЕНИЯ И УСТАРЕВАНИЕ ДАННЫХ
         function updateConnectionStatus(isConnected) {
             const connectionElement = document.getElementById('connectionStatus');
             nodeConnectionActive = isConnected;
@@ -505,14 +561,59 @@ void setup() {
             if (isConnected) {
                 connectionElement.className = 'connection-status connection-ok';
                 connectionElement.innerHTML = '✅ Связь с узлом: АКТИВНА';
+                
+                // Восстанавливаем нормальный вид данных при восстановлении связи
+                if (nodeDataStale) {
+                    console.log('Восстановление нормального вида данных');
+                    markNodeDataAsFresh();
+                    nodeDataStale = false;
+                }
             } else {
                 connectionElement.className = 'connection-status connection-lost';
                 connectionElement.innerHTML = '⚠️ Связь с узлом: ПОТЕРЯНА';
+                
+                // Отмечаем данные как устаревшие при потере связи
+                if (!nodeDataStale) {
+                    console.log('Помечаем данные узла как устаревшие');
+                    markNodeDataAsStale();
+                    nodeDataStale = true;
+                }
                 
                 // Также сбрасываем статус охраны при потере связи
                 document.getElementById('securityStatus').className = 'security-status security-normal';
                 document.getElementById('securityStatus').innerHTML = '🔒 ОХРАНА: НЕТ ДАННЫХ';
             }
+        }
+
+        // ПОМЕТИТЬ ДАННЫЕ УЗЛА КАК УСТАРЕВШИЕ (красный цвет)
+        function markNodeDataAsStale() {
+            // Применяем стили устаревания к элементам датчиков
+            const sensorItems = document.querySelectorAll('#nodeSensorData .sensor-item');
+            sensorItems.forEach(item => {
+                item.classList.add('stale-data');
+            });
+            
+            const sensorValues = document.querySelectorAll('#nodeSensorData .sensor-value');
+            sensorValues.forEach(value => {
+                value.classList.add('stale-data');
+            });
+            
+            // Воспроизводим короткий звуковой сигнал
+            playShortBeep();
+        }
+
+        // ВОССТАНОВИТЬ НОРМАЛЬНЫЙ ВИД ДАННЫХ
+        function markNodeDataAsFresh() {
+            // Убираем стили устаревания
+            const sensorItems = document.querySelectorAll('#nodeSensorData .sensor-item');
+            sensorItems.forEach(item => {
+                item.classList.remove('stale-data');
+            });
+            
+            const sensorValues = document.querySelectorAll('#nodeSensorData .sensor-value');
+            sensorValues.forEach(value => {
+                value.classList.remove('stale-data');
+            });
         }
 
         function sendCommand(cmd) {
@@ -595,7 +696,12 @@ void setup() {
             else if (msg.type === 'connection_lost') {
                 // Хаб сообщает о потере связи с узлом
                 console.log('Хаб сообщает: связь с узлом потеряна');
-                clearNodeData();
+                updateConnectionStatus(false);
+            }
+            else if (msg.type === 'connection_restored') {
+                // Хаб сообщает о восстановлении связи с узлом
+                console.log('Хаб сообщает: связь с узлом восстановлена');
+                updateConnectionStatus(true);
             }
             else if (msg.type === 'gpio_status') {
                 // ТОЛЬКО обновляем состояние LED, НЕ выводим блок GPIO
@@ -701,7 +807,8 @@ void setup() {
     Serial.println("\n=== ХАБ ГОТОВ К РАБОТЕ ===");
     Serial.println("1. Подключитесь к Wi-Fi: " + String(AP_SSID));
     Serial.println("2. Откройте: http://" + WiFi.softAPIP().toString());
-    Serial.println("3. Контроль связи: автоматически каждые 70 сек\n");
+    Serial.println("3. Контроль связи: автоматически каждые 70 сек");
+    Serial.println("4. Устаревшие данные окрашиваются в красный\n");
 }
 
 void loop() {
@@ -716,29 +823,58 @@ void loop() {
     delay(1000);
 }
 
+// НОВАЯ ФУНКЦИЯ: Отправка статуса соединения в веб-интерфейс
+void sendConnectionStatusToWeb(bool connected) {
+    StaticJsonDocument<100> doc;
+    if (connected) {
+        doc["type"] = "connection_restored";
+        Serial.println("📡 Связь с узлом восстановлена - отправка в веб");
+    } else {
+        doc["type"] = "connection_lost";
+        Serial.println("⚠️  Связь с узлом потеряна - отправка в веб");
+    }
+    
+    String jsonResponse;
+    serializeJson(doc, jsonResponse);
+    ws.textAll(jsonResponse);
+}
+
 void checkNodeConnection() {
     unsigned long currentTime = millis();
     
     // Проверяем, когда последний раз были данные от узла
-    if (lastNodeDataTime > 0 && (currentTime - lastNodeDataTime) > NODE_TIMEOUT_MS) {
-        // Связь потеряна - прошло больше 70 секунд
-        Serial.println("⚠️  СВЯЗЬ С УЗЛОМ ПОТЕРЯНА! Очистка данных на веб-странице.");
+    if (lastNodeDataTime > 0) {
+        unsigned long timeSinceLastData = currentTime - lastNodeDataTime;
         
-        // Отправляем сообщение в веб-интерфейс о потере связи
-        StaticJsonDocument<100> doc;
-        doc["type"] = "connection_lost";
-        String jsonResponse;
-        serializeJson(doc, jsonResponse);
-        ws.textAll(jsonResponse);
-        
-        // Сбрасываем таймер
-        lastNodeDataTime = 0;
+        if (timeSinceLastData > NODE_TIMEOUT_MS) {
+            // Связь потеряна - прошло больше 70 секунд
+            if (!nodeConnectionLost) {
+                nodeConnectionLost = true;
+                connectionLostTime = currentTime;
+                
+                Serial.println("⚠️  СВЯЗЬ С УЗЛОМ ПОТЕРЯНА!");
+                Serial.printf("   Последние данные были %lu секунд назад\n", timeSinceLastData / 1000);
+                
+                // Отправляем сообщение в веб-интерфейс о потере связи
+                sendConnectionStatusToWeb(false);
+            }
+            
+            // Проверяем кулдаун для звукового сигнала
+            if ((currentTime - connectionLostTime) > CONNECTION_LOST_COOLDOWN) {
+                connectionLostTime = currentTime; // Сбрасываем таймер
+                Serial.println("   🔔 Короткий звуковой сигнал отправлен в веб");
+            }
+        } else {
+            // Связь активна
+            if (nodeConnectionLost) {
+                nodeConnectionLost = false;
+                Serial.println("✅ СВЯЗЬ С УЗЛОМ ВОССТАНОВЛЕНА!");
+                
+                // Отправляем сообщение в веб-интерфейс о восстановлении связи
+                sendConnectionStatusToWeb(true);
+            }
+        }
     }
-}
-
-void clearNodeDataOnWeb() {
-    // Функция для очистки данных узла (вызывается из checkNodeConnection)
-    Serial.println("Очистка данных узла на веб-странице...");
 }
 
 void updateAlarmState() {
