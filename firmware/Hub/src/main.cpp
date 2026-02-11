@@ -1,7 +1,7 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
  * Универсальная версия с JSON структурой
- * ВЕРСИЯ 2.6: Контроль связи с цветовой индикацией + короткий звук
+ * ВЕРСИЯ 2.8: Оптимизация интерфейса
  */
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -73,15 +73,15 @@ void processNodeData(const uint8_t *data, int len);
 String relayStateToString(uint32_t state);
 void checkNodeConnection();
 void updateAlarmState();
-void sendConnectionStatusToWeb(bool connected); // Новая функция
+void sendConnectionStatusToWeb(bool connected);
 
 // ===================== SETUP =====================
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 2.6) ===");
-    Serial.println("=== Контроль связи + цветовая индикация + короткий звук ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 2.8) ===");
+    Serial.println("=== Оптимизированный интерфейс ===");
 
     WiFi.mode(WIFI_AP);
     if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
@@ -98,7 +98,7 @@ void setup() {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Умный дом ESP-NOW + Теплица</title>
+    <title>Умный дом ESP-NOW</title>
     <style>
         body {font-family: Arial; text-align: center; margin-top: 20px; max-width: 800px; margin-left: auto; margin-right: auto;}
         h1 {color: #333;}
@@ -126,53 +126,68 @@ void setup() {
         
         .section {
             background: #f9f9f9;
-            border-radius: 12px;
-            padding: 20px;
-            margin: 25px 0;
+            border-radius: 10px;
+            padding: 16px;
+            margin: 20px 0;
             box-shadow: 0 4px 6px rgba(0,0,0,0.05);
             text-align: left;
         }
         .section-title {
-            font-size: 1.5em;
-            margin-bottom: 15px;
+            font-size: 1.5em; /* Увеличено */
+            margin-bottom: 8px; /* Уменьшено */
             color: #2c3e50;
             border-bottom: 2px solid #3498db;
-            padding-bottom: 8px;
+            padding-bottom: 6px;
+            font-weight: bold; /* ЖИРНЫЙ шрифт для названий */
+        }
+        .section-info {
+            color: #7f8c8d;
+            font-size: 0.8em; /* Уменьшено */
+            margin-bottom: 10px;
+            font-style: italic;
         }
         .sensor-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 10px; /* Уменьшено */
             margin-top: 10px;
         }
         .sensor-item {
             background: white;
-            padding: 15px;
-            border-radius: 8px;
-            border-left: 5px solid #3498db;
+            padding: 8px 12px; /* Уменьшена высота: 8px сверху/снизу, 12px по бокам */
+            border-radius: 6px;
+            border-left: 4px solid #3498db;
             transition: all 0.3s;
+            min-height: 60px; /* Фиксированная минимальная высота */
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
         }
         .sensor-label {
             font-weight: bold;
             color: #555;
             display: block;
-            margin-bottom: 5px;
+            margin-bottom: 2px; /* Уменьшено */
+            font-size: 0.85em; /* Уменьшено */
         }
         .sensor-value {
-            font-size: 1.8em;
+            font-size: 1.5em; /* Уменьшено */
             font-family: 'Courier New', monospace;
             color: #2c3e50;
+            font-weight: bold;
             transition: all 0.3s;
+            line-height: 1.2;
         }
         .sensor-unit {
-            font-size: 0.9em;
+            font-size: 0.8em;
             color: #7f8c8d;
-            margin-left: 3px;
+            margin-left: 2px;
+            font-weight: normal;
         }
         
         /* СТИЛИ ДЛЯ УСТАРЕВШИХ ДАННЫХ */
         .sensor-item.stale-data {
-            border-left: 5px solid #e74c3c !important;
+            border-left: 4px solid #e74c3c !important;
             opacity: 0.7;
         }
         .sensor-value.stale-data {
@@ -185,10 +200,11 @@ void setup() {
         
         .relay-status {
             display: inline-block;
-            padding: 5px 12px;
-            border-radius: 20px;
+            padding: 3px 8px; /* Уменьшено */
+            border-radius: 12px; /* Уменьшено */
             font-weight: bold;
-            margin-top: 5px;
+            margin-top: 3px; /* Уменьшено */
+            font-size: 0.85em; /* Уменьшено */
             transition: all 0.3s;
         }
         .relay-on {
@@ -200,20 +216,21 @@ void setup() {
             color: white;
         }
         
-        /* КНОПКА LED (уменьшена и смещена влево) */
+        /* КНОПКА LED - УВЕЛИЧЕНА */
         #ledToggleBtn {
-            font-size: 14px;
-            padding: 10px 25px;
+            font-size: 15px; /* Увеличено */
+            padding: 12px 30px; /* Увеличено */
             border: none;
             border-radius: 8px;
             cursor: pointer;
             color: white;
             font-weight: bold;
             transition: all 0.3s;
-            width: 250px;
-            margin: 15px 0;
+            width: 280px; /* Увеличено */
+            margin: 12px 0;
             float: left;
             display: block;
+            min-height: 50px; /* Минимальная высота */
         }
         #ledToggleBtn.led-on {
             background: linear-gradient(135deg, #e74c3c, #c0392b);
@@ -234,13 +251,14 @@ void setup() {
             box-shadow: 0 4px 8px rgba(0,0,0,0.1);
         }
         
-        /* СТАТУС ОХРАНЫ И СОЕДИНЕНИЯ */
+        /* СТАТУС ОХРАНЫ */
         .security-status {
-            padding: 12px;
-            border-radius: 8px;
-            margin-top: 15px;
+            padding: 10px;
+            border-radius: 6px;
+            margin-top: 12px;
             text-align: center;
             font-weight: bold;
+            font-size: 0.95em;
             transition: all 0.3s;
         }
         .security-normal {
@@ -252,81 +270,48 @@ void setup() {
             color: white;
             animation: alarm-pulse 1s infinite;
         }
-        .connection-status {
-            padding: 10px;
-            border-radius: 8px;
-            margin-top: 10px;
-            text-align: center;
-            font-weight: bold;
-            transition: all 0.3s;
-        }
-        .connection-ok {
-            background: linear-gradient(135deg, #27ae60, #2ecc71);
-            color: white;
-        }
-        .connection-lost {
-            background: linear-gradient(135deg, #f39c12, #e67e22);
-            color: white;
-            animation: connection-pulse 2s infinite;
-        }
         @keyframes alarm-pulse {
             0% { opacity: 1; }
             50% { opacity: 0.7; }
             100% { opacity: 1; }
         }
-        @keyframes connection-pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.6; }
-            100% { opacity: 1; }
-        }
         
         .control-buttons {
-            margin-top: 20px;
+            margin-top: 16px;
             clear: both;
         }
         
         #lastUpdate {
-            font-size: 0.85em;
+            font-size: 0.75em;
             color: #95a5a6;
             text-align: right;
-            margin-top: 15px;
+            margin-top: 10px;
             font-style: italic;
         }
-        .node-info {
-            color: #7f8c8d;
-            font-size: 0.9em;
-            margin-bottom: 10px;
-            clear: both;
-        }
         #nodeSensorData { 
-            min-height: 100px; 
+            min-height: 80px;
             clear: both;
-            margin-top: 10px;
+            margin-top: 8px;
         }
     </style>
 </head>
 <body>
-    <h1>🏠 Умный дом ESP-NOW + 🌿 Теплица</h1>
+    <h1>🏠 Умный дом ESP-NOW</h1>
     
     <!-- КНОПКА ОБНОВИТЬ ДАННЫЕ -->
     <button id="refreshBtn" onclick="refreshNodeData()">🔄 ОБНОВИТЬ ДАННЫЕ</button>
 
-    <!-- Секция основного узла -->
+    <!-- Секция мастерской -->
     <div class="section">
-        <div class="section-title">📟 Основной узел (ID: 101)</div>
-        <div class="node-info">MAC: AC:EB:E6:49:10:28 | Проверка связи каждые 70 сек</div>
-        
-        <!-- СТАТУС СОЕДИНЕНИЯ -->
-        <div id="connectionStatus" class="connection-status connection-ok">
-            ✅ Связь с узлом: АКТИВНА
-        </div>
+        <div class="section-title">🔧 Мастерская</div>
+        <div class="section-info">MAC: AC:EB:E6:49:10:28</div>
         
         <!-- СТАТУС ОХРАНЫ -->
         <div id="securityStatus" class="security-status security-normal">
             🔒 ОХРАНА: НОРМА (концевики замкнуты)
         </div>
         
-        <!-- КНОПКА LED (смещена влево, уменьшена) -->
+        <!-- КНОПКА LED - УВЕЛИЧЕНА -->
         <button id="ledToggleBtn" class="led-unknown" onclick="toggleLED()">--</button>
         <div style="clear: both;"></div>
         
@@ -338,8 +323,8 @@ void setup() {
 
     <!-- Секция теплицы -->
     <div class="section">
-        <div class="section-title">🌿 Теплица (ID: 102)</div>
-        <div class="node-info">MAC: E8:9F:6D:87:34:8A | Данные обновляются каждые 30 сек.</div>
+        <div class="section-title">🌿 Теплица</div>
+        <div class="section-info">MAC: E8:9F:6D:87:34:8A</div>
         <div class="sensor-grid" id="greenhouseData">
             <div class="sensor-item">
                 <span class="sensor-label">Температура (внутри):</span>
@@ -354,11 +339,11 @@ void setup() {
                 <span class="sensor-value">--</span><span class="sensor-unit">%</span>
             </div>
             <div class="sensor-item">
-                <span class="sensor-label">Реле 1 (основное):</span><br>
+                <span class="sensor-label">Реле 1 (основное):</span>
                 <span id="relay1State" class="relay-status relay-off">--</span>
             </div>
             <div class="sensor-item">
-                <span class="sensor-label">Реле 2 (доп.):</span><br>
+                <span class="sensor-label">Реле 2 (доп.):</span>
                 <span id="relay2State" class="relay-status relay-off">--</span>
             </div>
         </div>
@@ -372,7 +357,7 @@ void setup() {
         let buttonLocked = false;
         let nodeConnectionActive = true;
         let connectionCheckInterval = null;
-        let nodeDataStale = false; // Флаг устаревания данных
+        let nodeDataStale = false;
 
         // ================== АУДИО ДЛЯ ТРЕВОГИ И КОРОТКИХ СИГНАЛОВ ==================
         let audioContext = null;
@@ -547,42 +532,9 @@ void setup() {
             console.log('Очистка данных узла на веб-странице');
             ledState = 'unknown';
             nodeConnectionActive = false;
-            updateConnectionStatus(false);
             updateLEDButton();
             document.getElementById('nodeSensorData').innerHTML = 
                 '<p style="color:#e74c3c;">⏳ Запрос данных отправлен. Ожидание ответа...</p>';
-        }
-
-        // ОБНОВЛЕНИЕ СТАТУСА СОЕДИНЕНИЯ И УСТАРЕВАНИЕ ДАННЫХ
-        function updateConnectionStatus(isConnected) {
-            const connectionElement = document.getElementById('connectionStatus');
-            nodeConnectionActive = isConnected;
-            
-            if (isConnected) {
-                connectionElement.className = 'connection-status connection-ok';
-                connectionElement.innerHTML = '✅ Связь с узлом: АКТИВНА';
-                
-                // Восстанавливаем нормальный вид данных при восстановлении связи
-                if (nodeDataStale) {
-                    console.log('Восстановление нормального вида данных');
-                    markNodeDataAsFresh();
-                    nodeDataStale = false;
-                }
-            } else {
-                connectionElement.className = 'connection-status connection-lost';
-                connectionElement.innerHTML = '⚠️ Связь с узлом: ПОТЕРЯНА';
-                
-                // Отмечаем данные как устаревшие при потере связи
-                if (!nodeDataStale) {
-                    console.log('Помечаем данные узла как устаревшие');
-                    markNodeDataAsStale();
-                    nodeDataStale = true;
-                }
-                
-                // Также сбрасываем статус охраны при потере связи
-                document.getElementById('securityStatus').className = 'security-status security-normal';
-                document.getElementById('securityStatus').innerHTML = '🔒 ОХРАНА: НЕТ ДАННЫХ';
-            }
         }
 
         // ПОМЕТИТЬ ДАННЫЕ УЗЛА КАК УСТАРЕВШИЕ (красный цвет)
@@ -665,7 +617,6 @@ void setup() {
                 console.log('Получен статус LED:', msg.state);
                 ledState = msg.state;
                 buttonLocked = false;
-                updateConnectionStatus(true);
                 updateLEDButton();
             }
             else if (msg.type === 'sensor_data') {
@@ -681,7 +632,6 @@ void setup() {
                 }
                 html += '</div>';
                 document.getElementById('nodeSensorData').innerHTML = html;
-                updateConnectionStatus(true);
                 
                 if (ledState === 'unknown') {
                     sendCommand('GET_STATUS');
@@ -690,24 +640,24 @@ void setup() {
             else if (msg.type === 'security') {
                 // ОБРАБОТКА СТАТУСА ОХРАНЫ
                 console.log('Статус охраны:', msg.alarm);
-                updateConnectionStatus(true);
                 updateSecurityStatus(msg.alarm, msg.contact1, msg.contact2);
             }
             else if (msg.type === 'connection_lost') {
                 // Хаб сообщает о потере связи с узлом
                 console.log('Хаб сообщает: связь с узлом потеряна');
-                updateConnectionStatus(false);
+                markNodeDataAsStale();
+                nodeDataStale = true;
             }
             else if (msg.type === 'connection_restored') {
                 // Хаб сообщает о восстановлении связи с узлом
                 console.log('Хаб сообщает: связь с узлом восстановлена');
-                updateConnectionStatus(true);
+                markNodeDataAsFresh();
+                nodeDataStale = false;
             }
             else if (msg.type === 'gpio_status') {
                 // ТОЛЬКО обновляем состояние LED, НЕ выводим блок GPIO
                 if (msg.gpio8 !== undefined) {
                     ledState = msg.gpio8 ? 'on' : 'off';
-                    updateConnectionStatus(true);
                     updateLEDButton();
                 }
             }
@@ -933,7 +883,7 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
 
     uint8_t nodeMac[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
     if (memcmp(mac_addr, nodeMac, 6) == 0) {
-        Serial.printf("\n📥 Пакет от основного узла (%s), длина: %d байт\n", macStr, len);
+        Serial.printf("\n📥 Пакет от мастерской (%s), длина: %d байт\n", macStr, len);
         lastNodeDataTime = millis();  // Обновляем время последних данных
         processNodeData(incomingData, len);
         return;
@@ -963,7 +913,7 @@ void processNodeData(const uint8_t *data, int len) {
         return;
     }
     
-    Serial.print("📥 JSON от узла: ");
+    Serial.print("📥 JSON от мастерской: ");
     Serial.println(incomingMessage.json);
 
     StaticJsonDocument<256> doc;
@@ -1028,7 +978,7 @@ void processNodeData(const uint8_t *data, int len) {
         const char* cmd = doc["command"];
         const char* status = doc["status"];
         
-        Serial.printf("✅ Подтверждение от узла: команда '%s', статус '%s'\n", cmd, status);
+        Serial.printf("✅ Подтверждение от мастерской: команда '%s', статус '%s'\n", cmd, status);
         
         if (strcmp(cmd, "LED_ON") == 0) {
             StaticJsonDocument<200> response;
