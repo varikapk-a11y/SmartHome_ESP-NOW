@@ -1,6 +1,7 @@
 /**
- * SmartHome ESP-NOW Узел (ESP32-C3) с охраной
+ * SmartHome ESP-NOW Узел (ESP32-C3) с охраной и энкодером
  * Универсальная версия с JSON структурой и концевиками
+ * ВЕРСИЯ 2.1: Добавлен AS5600 магнитный энкодер
  */
 #include <Arduino.h>
 #include <WiFi.h>
@@ -18,10 +19,17 @@
 #define CONTACT2_PIN 4    // GPIO для концевика 2 (НОРМАЛЬНО ЗАМКНУТ)
 #define SENSOR_READ_INTERVAL 30000 // 30 сек
 #define SECURITY_CHECK_INTERVAL 2000 // 2 сек - проверка концевиков
+#define ENCODER_READ_INTERVAL 1000  // 1 сек - чтение энкодера
 
 // I2C пины для ESP32-C3
 const int SDA_PIN = 1;
 const int SCL_PIN = 0;
+
+// ---- AS5600 КОНСТАНТЫ ----
+#define AS5600_ADDR 0x36
+#define ANGLE_H_REG 0x0E
+#define ANGLE_L_REG 0x0F
+#define STATUS_REG 0x0B
 
 // ---- УНИВЕРСАЛЬНАЯ СТРУКТУРА ESP-NOW ----
 typedef struct esp_now_message {
@@ -34,12 +42,23 @@ Adafruit_BMP280 bmp;
 Adafruit_AHTX0 aht;
 bool hasBMP = false;
 bool hasAHT = false;
+bool hasAS5600 = false;  // Флаг наличия энкодера
+
 esp_now_message incomingMessage;
 esp_now_message outgoingMessage;
+
 unsigned long lastSensorReadTime = 0;
 unsigned long lastSecurityCheck = 0;
+unsigned long lastEncoderReadTime = 0;  // Таймер для энкодера
+
 bool lastContact1Alarm = false;   // false = норма (замкнут), true = тревога (разомкнут)
 bool lastContact2Alarm = false;   // false = норма (замкнут), true = тревога (разомкнут)
+
+// Буфер для чтения AS5600
+uint8_t angle_data[2];
+uint16_t lastRawAngle = 0;        // Последний прочитанный угол
+float lastAngleDeg = 0.0;         // Последний угол в градусах
+bool magnetDetected = false;      // Флаг наличия магнита
 
 // MAC хаба
 uint8_t hubMacAddress[] = {0x9C, 0x9C, 0x1F, 0xC7, 0x2D, 0x94};
@@ -53,29 +72,32 @@ void sendGpioStatus();
 bool initSensors();
 void checkSecuritySensors();
 void sendSecurityStatus(bool contact1Alarm, bool contact2Alarm);
+void initAS5600();                 // Инициализация энкодера
+uint16_t readRawAngle();          // Чтение сырого угла AS5600
+void readAndSendEncoderData();    // Чтение и отправка данных энкодера
 
 // ===================== SETUP =====================
 void setup() {
     Serial.begin(115200);
     delay(3000);
 
-    Serial.println("\n=== УЗЕЛ ESP-NOW (JSON версия с охраной) ===");
+    Serial.println("\n=== УЗЕЛ ESP-NOW (JSON версия с охраной + AS5600) ===");
     Serial.println("MAC: AC:EB:E6:49:10:28 | ID: 101");
     Serial.println("Концевики: GPIO3 и GPIO4 (тревога при РАЗРЫВЕ цепи)");
+    Serial.println("Энкодер: AS5600 на I2C (SDA=1, SCL=0)");
 
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, HIGH);
 
     // Инициализация концевиков (INPUT_PULLUP - нормально замкнутая цепь)
-    // При замыкании на GND: пин = LOW = норма
-    // При разрыве цепи: пин = HIGH = тревога (через внутреннюю подтяжку)
     pinMode(CONTACT1_PIN, INPUT_PULLUP);
     pinMode(CONTACT2_PIN, INPUT_PULLUP);
     Serial.println("[0] Концевики инициализированы (INPUT_PULLUP, нормально-замкнутые)");
 
     // I2C
     Wire.begin(SDA_PIN, SCL_PIN);
-    Serial.println("[1] I2C инициализирован.");
+    Wire.setClock(100000);  // Фиксированная скорость для совместимости
+    Serial.println("[1] I2C инициализирован (100 кГц).");
 
     // Датчики
     Serial.println("[2] Инициализация датчиков...");
@@ -109,8 +131,6 @@ void setup() {
     }
 
     // Первоначальная проверка концевиков
-    // При замыкании на GND: digitalRead() = LOW (0) = норма
-    // При разрыве цепи: digitalRead() = HIGH (1) = тревога
     lastContact1Alarm = (digitalRead(CONTACT1_PIN) == HIGH);
     lastContact2Alarm = (digitalRead(CONTACT2_PIN) == HIGH);
     
@@ -120,8 +140,17 @@ void setup() {
     Serial.print(", Концевик2=");
     Serial.println(lastContact2Alarm ? "ТРЕВОГА (разомкнут)" : "НОРМА (замкнут)");
 
+    // Инициализация AS5600
+    initAS5600();
+
     // Отправка начального статуса на хаб
     sendSecurityStatus(lastContact1Alarm, lastContact2Alarm);
+    
+    // Первое чтение энкодера
+    if (hasAS5600) {
+        readAndSendEncoderData();
+        lastEncoderReadTime = millis();
+    }
 
     Serial.println("\n=== УЗЕЛ ГОТОВ К РАБОТЕ ===\n");
     readAndSendSensorData();
@@ -145,12 +174,20 @@ void loop() {
         lastSecurityCheck = now;
     }
     
+    // Чтение энкодера каждую 1 секунду (если найден)
+    if (hasAS5600 && (now - lastEncoderReadTime >= ENCODER_READ_INTERVAL)) {
+        readAndSendEncoderData();
+        lastEncoderReadTime = now;
+    }
+    
     delay(100);
 }
 
-// ===================== ФУНКЦИИ =====================
+// ===================== ФУНКЦИИ ДАТЧИКОВ =====================
 bool initSensors() {
     bool ok = false;
+    
+    // BMP280
     if (bmp.begin(0x76)) {
         hasBMP = true;
         bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
@@ -163,6 +200,8 @@ bool initSensors() {
     } else {
         Serial.println("  -> ❌ BMP280 не найден");
     }
+    
+    // AHT20
     if (aht.begin()) {
         hasAHT = true;
         Serial.println("  -> ✅ AHT20 найден");
@@ -170,10 +209,104 @@ bool initSensors() {
     } else {
         Serial.println("  -> ❌ AHT20 не найден");
     }
+    
     return ok;
 }
 
-// ОТПРАВКА ЛЮБОГО JSON НА ХАБ
+// ===================== ФУНКЦИИ AS5600 =====================
+void initAS5600() {
+    Serial.print("[AS5600] Проверка... ");
+    
+    Wire.beginTransmission(AS5600_ADDR);
+    byte error = Wire.endTransmission();
+    
+    if (error == 0) {
+        hasAS5600 = true;
+        Serial.println("✅ Датчик обнаружен по адресу 0x36");
+        
+        // Проверка магнита
+        Wire.beginTransmission(AS5600_ADDR);
+        Wire.write(STATUS_REG);
+        Wire.endTransmission(false);
+        Wire.requestFrom(AS5600_ADDR, 1);
+        
+        if (Wire.available()) {
+            byte status = Wire.read();
+            Serial.print("   Статус: 0x");
+            Serial.print(status, HEX);
+            
+            if (status & 0x20) {
+                magnetDetected = true;
+                Serial.println(" | ✅ Магнит обнаружен");
+            } else {
+                magnetDetected = false;
+                Serial.println(" | ❌ Магнит НЕ обнаружен");
+            }
+        }
+        
+        // Первое чтение угла
+        lastRawAngle = readRawAngle();
+        lastAngleDeg = (lastRawAngle * 360.0) / 4096.0;
+        Serial.printf("   Начальный угол: %.1f° (%d)\n", lastAngleDeg, lastRawAngle);
+        
+    } else {
+        hasAS5600 = false;
+        Serial.printf("❌ Датчик НЕ найден (ошибка: %d)\n", error);
+    }
+}
+
+uint16_t readRawAngle() {
+    Wire.beginTransmission(AS5600_ADDR);
+    Wire.write(ANGLE_H_REG);
+    Wire.endTransmission(false);
+    
+    Wire.requestFrom(AS5600_ADDR, 2);
+    if (Wire.available() >= 2) {
+        angle_data[0] = Wire.read();
+        angle_data[1] = Wire.read();
+        return (angle_data[0] << 8) | angle_data[1];
+    }
+    return 0;
+}
+
+void readAndSendEncoderData() {
+    if (!hasAS5600) return;
+    
+    uint16_t raw_angle = readRawAngle();
+    float angle_deg = (raw_angle * 360.0) / 4096.0;
+    
+    // Проверка магнита
+    Wire.beginTransmission(AS5600_ADDR);
+    Wire.write(STATUS_REG);
+    Wire.endTransmission(false);
+    Wire.requestFrom(AS5600_ADDR, 1);
+    
+    if (Wire.available()) {
+        byte status = Wire.read();
+        magnetDetected = (status & 0x20);
+    }
+    
+    // Формируем JSON для отправки
+    char json[128];
+    snprintf(json, sizeof(json),
+        "{\"type\":\"encoder\",\"angle\":%.1f,\"raw\":%d,\"magnet\":%s}",
+        angle_deg,
+        raw_angle,
+        magnetDetected ? "true" : "false");
+    
+    Serial.print("[AS5600] Отправка: ");
+    Serial.printf("%.1f° (%d), магнит: %s\n", 
+                  angle_deg, 
+                  raw_angle, 
+                  magnetDetected ? "есть" : "нет");
+    
+    sendJsonToHub(json);
+    
+    lastRawAngle = raw_angle;
+    lastAngleDeg = angle_deg;
+}
+
+// ===================== ФУНКЦИИ ОТПРАВКИ =====================
 void sendJsonToHub(const char* json_string) {
     size_t json_len = strlen(json_string);
     if (json_len >= sizeof(outgoingMessage.json)) {
@@ -220,7 +353,6 @@ void readAndSendSensorData() {
     sendJsonToHub(json);
 }
 
-// ОТПРАВКА СОСТОЯНИЯ GPIO (LED)
 void sendGpioStatus() {
     char json[64];
     snprintf(json, sizeof(json),
@@ -232,19 +364,17 @@ void sendGpioStatus() {
     sendJsonToHub(json);
 }
 
-// ПРОВЕРКА СОСТОЯНИЯ КОНЦЕВИКОВ
+// ===================== ФУНКЦИИ ОХРАНЫ =====================
 void checkSecuritySensors() {
-    // С PULLUP: LOW = цепь замкнута (норма), HIGH = цепь разорвана (тревога)
     bool currentContact1Alarm = (digitalRead(CONTACT1_PIN) == HIGH);
     bool currentContact2Alarm = (digitalRead(CONTACT2_PIN) == HIGH);
     
-    // Если состояние изменилось - отправляем уведомление
     if (currentContact1Alarm != lastContact1Alarm || currentContact2Alarm != lastContact2Alarm) {
         Serial.print("[ОХРАНА] Изменение: ");
         Serial.print("Концевик1=");
-        Serial.print(currentContact1Alarm ? "ТРЕВОГА (разомкнут)" : "НОРМА (замкнут)");
+        Serial.print(currentContact1Alarm ? "ТРЕВОГА" : "НОРМА");
         Serial.print(", Концевик2=");
-        Serial.print(currentContact2Alarm ? "ТРЕВОГА (разомкнут)" : "НОРМА (замкнут)");
+        Serial.print(currentContact2Alarm ? "ТРЕВОГА" : "НОРМА");
         Serial.println(" | Отправка на хаб...");
         
         sendSecurityStatus(currentContact1Alarm, currentContact2Alarm);
@@ -254,7 +384,6 @@ void checkSecuritySensors() {
     }
 }
 
-// ОТПРАВКА СТАТУСА ОХРАНЫ
 void sendSecurityStatus(bool contact1Alarm, bool contact2Alarm) {
     char json[128];
     snprintf(json, sizeof(json),
@@ -268,9 +397,8 @@ void sendSecurityStatus(bool contact1Alarm, bool contact2Alarm) {
     sendJsonToHub(json);
 }
 
-// ОБРАБОТКА ВХОДЯЩИХ КОМАНД
+// ===================== ОБРАБОТКА КОМАНД =====================
 void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
-    // --- ФИЛЬТР: Принимаем данные ТОЛЬКО от нашего хаба ---
     uint8_t hubMac[] = {0x9C, 0x9C, 0x1F, 0xC7, 0x2D, 0x94};
     if (memcmp(mac_addr, hubMac, 6) != 0) {
         char macStr[18];
@@ -281,14 +409,12 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
         Serial.println(macStr);
         return;
     }
-    // --- КОНЕЦ ФИЛЬТРА ---
 
     memcpy(&incomingMessage, incomingData, sizeof(incomingMessage));
     
     Serial.print("📥 JSON от хаба: ");
     Serial.println(incomingMessage.json);
     
-    // Парсим JSON
     StaticJsonDocument<128> doc;
     DeserializationError error = deserializeJson(doc, incomingMessage.json);
     
@@ -317,10 +443,16 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
             Serial.println("  -> 📡 Запрос данных...");
             readAndSendSensorData();
             sendGpioStatus();
-            // При запросе статуса также отправляем состояние охраны
+            
+            // Отправляем состояние охраны
             bool contact1Alarm = (digitalRead(CONTACT1_PIN) == HIGH);
             bool contact2Alarm = (digitalRead(CONTACT2_PIN) == HIGH);
             sendSecurityStatus(contact1Alarm, contact2Alarm);
+            
+            // Отправляем данные энкодера, если он есть
+            if (hasAS5600) {
+                readAndSendEncoderData();
+            }
         }
     }
 }
