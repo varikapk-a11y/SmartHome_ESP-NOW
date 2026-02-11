@@ -19,7 +19,7 @@
 #define CONTACT2_PIN 4    // GPIO для концевика 2 (НОРМАЛЬНО ЗАМКНУТ)
 #define SENSOR_READ_INTERVAL 30000 // 30 сек
 #define SECURITY_CHECK_INTERVAL 2000 // 2 сек - проверка концевиков
-#define ENCODER_READ_INTERVAL 1000  // 1 сек - чтение энкодера
+#define ENCODER_READ_INTERVAL 5000  // 5 сек - чтение энкодера
 
 // I2C пины для ESP32-C3
 const int SDA_PIN = 1;

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body {
+            background: #2c3e50;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            font-family: Arial;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            text-align: center;
+        }
+        .compass {
+            position: relative;
+            width: 300px;
+            height: 300px;
+            margin: 0 auto;
+        }
+        svg {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        .direction {
+            position: absolute;
+            font-size: 20px;
+            font-weight: bold;
+            color: #2c3e50;
+            text-shadow: 1px 1px 2px white;
+            z-index: 10;
+        }
+        .n { top: 10px; left: 50%; transform: translateX(-50%); }
+        .e { right: 10px; top: 50%; transform: translateY(-50%); }
+        .s { bottom: 10px; left: 50%; transform: translateX(-50%); }
+        .w { left: 10px; top: 50%; transform: translateY(-50%); }
+        
+        .info {
+            margin-top: 20px;
+            color: white;
+        }
+        button {
+            margin: 5px;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            background: #3498db;
+            color: white;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="compass">
+            <div class="direction n">N</div>
+            <div class="direction e">E</div>
+            <div class="direction s">S</div>
+            <div class="direction w">W</div>
+            
+            <svg viewBox="0 0 100 100">
+                <circle cx="50" cy="50" r="48" fill="#ecf0f1" stroke="#34495e" stroke-width="2"/>
+                <path id="sector" d="" fill="#e74c3c" fill-opacity="0.7"/>
+                <circle cx="50" cy="50" r="4" fill="#34495e" stroke="white" stroke-width="2"/>
+            </svg>
+        </div>
+        
+        <div class="info">
+            <h2 id="direction" style="color: white;">355°</h2>
+            <p id="range" style="color: #ecf0f1;">от 340° до 10°</p>
+            <div style="margin-top: 20px;">
+                <button onclick="setWind(355, 30)">🔴 355° ±15° (30° сектор)</button>
+                <button onclick="setWind(60, 80)">🟠 60° ±40° (80° сектор)</button>
+                <button onclick="setWind(180, 60)">🟣 180° ±30° (60° сектор)</button>
+                <button onclick="setWind(270, 60)">🔵 270° ±30° (60° сектор)</button>
+                <button onclick="setWind(0, 30)">⚫ 0° ±15° (30° сектор)</button>
+                <button onclick="setWind(90, 60)">🟢 90° ±30° (60° сектор)</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function setWind(center, width) {
+            // Вычисляем границы сектора
+            let start = center - width/2;
+            let end = center + width/2;
+            
+            // Нормализуем в 0-360
+            start = ((start % 360) + 360) % 360;
+            end = ((end % 360) + 360) % 360;
+            
+            document.getElementById('direction').innerHTML = center + '°';
+            document.getElementById('range').innerHTML = 'от ' + start.toFixed(0) + '° до ' + end.toFixed(0) + '°';
+            
+            const sector = document.getElementById('sector');
+            
+            function degToRad(deg) {
+                return (deg - 90) * Math.PI / 180;
+            }
+            
+            let cx = 50, cy = 50, r = 48;
+            
+            if (start < end) {
+                // Сектор не пересекает 0
+                let startRad = degToRad(start);
+                let endRad = degToRad(end);
+                
+                let x1 = cx + r * Math.cos(startRad);
+                let y1 = cy + r * Math.sin(startRad);
+                let x2 = cx + r * Math.cos(endRad);
+                let y2 = cy + r * Math.sin(endRad);
+                
+                let d = `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 0 1 ${x2} ${y2} Z`;
+                sector.setAttribute('d', d);
+            } else {
+                // Сектор пересекает 0 - рисуем в два этапа
+                // Первая часть: от start до 360
+                let startRad = degToRad(start);
+                let endRad1 = degToRad(360);
+                
+                let x1 = cx + r * Math.cos(startRad);
+                let y1 = cy + r * Math.sin(startRad);
+                let x2_1 = cx + r * Math.cos(endRad1);
+                let y2_1 = cy + r * Math.sin(endRad1);
+                
+                // Вторая часть: от 0 до end
+                let startRad2 = degToRad(0);
+                let endRad2 = degToRad(end);
+                
+                let x1_2 = cx + r * Math.cos(startRad2);
+                let y1_2 = cy + r * Math.sin(startRad2);
+                let x2 = cx + r * Math.cos(endRad2);
+                let y2 = cy + r * Math.sin(endRad2);
+                
+                let d = `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 0 1 ${x2_1} ${y2_1} Z
+                         M ${cx} ${cy} L ${x1_2} ${y1_2} A ${r} ${r} 0 0 1 ${x2} ${y2} Z`;
+                sector.setAttribute('d', d);
+            }
+        }
+        
+        setWind(355, 30);
+    </script>
+</body>
+</html>

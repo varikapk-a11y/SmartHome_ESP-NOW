@@ -1,13 +1,13 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
- * Универсальная версия с JSON структурой
- * ВЕРСИЯ 2.8: Оптимизация интерфейса
+ * ВЕРСИЯ 4.0: Ветер - скользящее среднее двух точек
  */
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
 #include <esp_now.h>
 #include <ArduinoJson.h>
+#include <math.h>
 
 // ---- 1. КОНФИГУРАЦИЯ ----
 const char* AP_SSID = "SmartHome-Hub";
@@ -45,43 +45,50 @@ AsyncWebSocket ws("/ws");
 esp_now_message outgoingMessage;
 esp_now_message incomingMessage;
 
-// Таймеры для контроля связи с узлом
 unsigned long lastNodeDataTime = 0;
 unsigned long lastGreenhouseUpdate = 0;
-const unsigned long NODE_TIMEOUT_MS = 70000;  // 2 сеанса связи + запас (35 сек * 2)
+const unsigned long NODE_TIMEOUT_MS = 70000;
 const unsigned long GREENHOUSE_UPDATE_INTERVAL = 30000;
 
-// Флаги контроля связи
-bool nodeConnectionLost = false;      // Флаг потери связи с узлом
-unsigned long connectionLostTime = 0; // Время потери связи
-const unsigned long CONNECTION_LOST_COOLDOWN = 10000; // 10 сек до следующего звукового сигнала
+bool nodeConnectionLost = false;
+unsigned long connectionLostTime = 0;
+const unsigned long CONNECTION_LOST_COOLDOWN = 10000;
 
-// Флаг тревоги для звука
 bool securityAlarmActive = false;
 unsigned long alarmStartTime = 0;
-const unsigned long ALARM_DURATION_MS = 10000;  // 10 секунд
+const unsigned long ALARM_DURATION_MS = 10000;
 
-// ---- 5. ПРОТОТИПЫ ----
+// ---- 5. ДАННЫЕ ЭНКОДЕРА AS5600 - ДВЕ ТОЧКИ ----
+float prevEncoderAngle = -1.0;
+float currentEncoderAngle = -1.0;
+float windDirection = 0.0;
+float windSector = 0.0;
+bool windMagnet = false;
+unsigned long lastEncoderBroadcastTime = 0;
+const unsigned long ENCODER_BROADCAST_INTERVAL = 5000;
+
+// ---- 6. ПРОТОТИПЫ ----
 void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                      AwsEventType type, void *arg, uint8_t *data, size_t len);
 void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
 void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
 void sendToNode(String cmd);
-void broadcastWs(String type, String text, String state = "");
 void processGreenhouseData(const uint8_t *data);
 void processNodeData(const uint8_t *data, int len);
 String relayStateToString(uint32_t state);
 void checkNodeConnection();
 void updateAlarmState();
 void sendConnectionStatusToWeb(bool connected);
+void processEncoderData(float angle, bool magnet);
+void broadcastEncoderData();
 
 // ===================== SETUP =====================
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 2.8) ===");
-    Serial.println("=== Оптимизированный интерфейс ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 4.0) ===");
+    Serial.println("=== Ветер: скользящее среднее двух точек, без буфера ===");
 
     WiFi.mode(WIFI_AP);
     if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
@@ -100,10 +107,25 @@ void setup() {
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Умный дом ESP-NOW</title>
     <style>
-        body {font-family: Arial; text-align: center; margin-top: 20px; max-width: 800px; margin-left: auto; margin-right: auto;}
-        h1 {color: #333;}
-        
-        /* КНОПКА ОБНОВИТЬ ДАННЫЕ */
+        body {
+            font-family: Arial;
+            background: #2c3e50;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+        .dashboard {
+            max-width: 800px;
+            width: 100%;
+        }
+        h1 {
+            color: white;
+            text-align: center;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
         #refreshBtn {
             font-size: 14px;
             padding: 10px 25px;
@@ -123,42 +145,41 @@ void setup() {
             transform: translateY(-2px);
             box-shadow: 0 4px 8px rgba(0,0,0,0.1);
         }
-        
         .section {
             background: #f9f9f9;
             border-radius: 10px;
             padding: 16px;
             margin: 20px 0;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.05);
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
             text-align: left;
         }
         .section-title {
-            font-size: 1.5em; /* Увеличено */
-            margin-bottom: 8px; /* Уменьшено */
+            font-size: 1.5em;
+            margin-bottom: 8px;
             color: #2c3e50;
             border-bottom: 2px solid #3498db;
             padding-bottom: 6px;
-            font-weight: bold; /* ЖИРНЫЙ шрифт для названий */
+            font-weight: bold;
         }
         .section-info {
             color: #7f8c8d;
-            font-size: 0.8em; /* Уменьшено */
+            font-size: 0.8em;
             margin-bottom: 10px;
             font-style: italic;
         }
         .sensor-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 10px; /* Уменьшено */
+            gap: 10px;
             margin-top: 10px;
         }
         .sensor-item {
             background: white;
-            padding: 8px 12px; /* Уменьшена высота: 8px сверху/снизу, 12px по бокам */
+            padding: 8px 12px;
             border-radius: 6px;
             border-left: 4px solid #3498db;
             transition: all 0.3s;
-            min-height: 60px; /* Фиксированная минимальная высота */
+            min-height: 60px;
             display: flex;
             flex-direction: column;
             justify-content: center;
@@ -167,45 +188,32 @@ void setup() {
             font-weight: bold;
             color: #555;
             display: block;
-            margin-bottom: 2px; /* Уменьшено */
-            font-size: 0.85em; /* Уменьшено */
+            margin-bottom: 2px;
+            font-size: 0.85em;
         }
         .sensor-value {
-            font-size: 1.5em; /* Уменьшено */
+            font-size: 1.5em;
             font-family: 'Courier New', monospace;
             color: #2c3e50;
             font-weight: bold;
-            transition: all 0.3s;
             line-height: 1.2;
         }
         .sensor-unit {
             font-size: 0.8em;
             color: #7f8c8d;
             margin-left: 2px;
-            font-weight: normal;
         }
-        
-        /* СТИЛИ ДЛЯ УСТАРЕВШИХ ДАННЫХ */
         .sensor-item.stale-data {
             border-left: 4px solid #e74c3c !important;
             opacity: 0.7;
         }
-        .sensor-value.stale-data {
-            color: #e74c3c !important;
-        }
-        .data-stale {
-            color: #e74c3c !important;
-            opacity: 0.7;
-        }
-        
         .relay-status {
             display: inline-block;
-            padding: 3px 8px; /* Уменьшено */
-            border-radius: 12px; /* Уменьшено */
+            padding: 3px 8px;
+            border-radius: 12px;
             font-weight: bold;
-            margin-top: 3px; /* Уменьшено */
-            font-size: 0.85em; /* Уменьшено */
-            transition: all 0.3s;
+            margin-top: 3px;
+            font-size: 0.85em;
         }
         .relay-on {
             background-color: #27ae60;
@@ -215,22 +223,19 @@ void setup() {
             background-color: #e74c3c;
             color: white;
         }
-        
-        /* КНОПКА LED - УВЕЛИЧЕНА */
         #ledToggleBtn {
-            font-size: 15px; /* Увеличено */
-            padding: 12px 30px; /* Увеличено */
+            font-size: 15px;
+            padding: 12px 30px;
             border: none;
             border-radius: 8px;
             cursor: pointer;
             color: white;
             font-weight: bold;
             transition: all 0.3s;
-            width: 280px; /* Увеличено */
+            width: 280px;
             margin: 12px 0;
             float: left;
-            display: block;
-            min-height: 50px; /* Минимальная высота */
+            min-height: 50px;
         }
         #ledToggleBtn.led-on {
             background: linear-gradient(135deg, #e74c3c, #c0392b);
@@ -242,16 +247,6 @@ void setup() {
             background: #95a5a6;
             cursor: not-allowed;
         }
-        #ledToggleBtn:disabled {
-            opacity: 0.7;
-            cursor: not-allowed;
-        }
-        #ledToggleBtn:not(:disabled):hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-        }
-        
-        /* СТАТУС ОХРАНЫ */
         .security-status {
             padding: 10px;
             border-radius: 6px;
@@ -276,11 +271,84 @@ void setup() {
             100% { opacity: 1; }
         }
         
-        .control-buttons {
-            margin-top: 16px;
-            clear: both;
+        /* Компас */
+        .wind-compact {
+            cursor: pointer;
+            transition: all 0.3s ease;
         }
+        .compass-container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            margin: 0 auto;
+        }
+        .compass-container svg {
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        .direction {
+            position: absolute;
+            font-size: 14px;
+            font-weight: bold;
+            color: #e74c3c;
+            text-shadow: 1px 1px 2px white;
+            z-index: 10;
+        }
+        .n { top: 5px; left: 50%; transform: translateX(-50%); }
+        .e { right: 5px; top: 50%; transform: translateY(-50%); }
+        .s { bottom: 5px; left: 50%; transform: translateX(-50%); }
+        .w { left: 5px; top: 50%; transform: translateY(-50%); }
         
+        .wind-stats {
+            text-align: center;
+            margin-top: 5px;
+            padding: 5px;
+            background: white;
+            border-radius: 8px;
+            font-size: 12px;
+        }
+        .wind-angle {
+            font-size: 20px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .wind-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: bold;
+            color: white;
+            margin-left: 8px;
+        }
+        .wind-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 9998;
+            justify-content: center;
+            align-items: center;
+        }
+        .wind-modal-content {
+            width: 80vw;
+            height: 80vw;
+            max-width: 600px;
+            max-height: 600px;
+            background: white;
+            border-radius: 30px;
+            padding: 30px;
+            position: relative;
+        }
+        .wind-modal-content .direction {
+            font-size: 24px;
+        }
         #lastUpdate {
             font-size: 0.75em;
             color: #95a5a6;
@@ -288,199 +356,216 @@ void setup() {
             margin-top: 10px;
             font-style: italic;
         }
-        #nodeSensorData { 
-            min-height: 80px;
-            clear: both;
-            margin-top: 8px;
-        }
+        .clearfix { clear: both; }
     </style>
 </head>
 <body>
-    <h1>🏠 Умный дом ESP-NOW</h1>
-    
-    <!-- КНОПКА ОБНОВИТЬ ДАННЫЕ -->
-    <button id="refreshBtn" onclick="refreshNodeData()">🔄 ОБНОВИТЬ ДАННЫЕ</button>
-
-    <!-- Секция мастерской -->
-    <div class="section">
-        <div class="section-title">🔧 Мастерская</div>
-        <div class="section-info">MAC: AC:EB:E6:49:10:28</div>
+    <div class="dashboard">
+        <h1>🏠 Умный дом ESP-NOW</h1>
         
-        <!-- СТАТУС ОХРАНЫ -->
-        <div id="securityStatus" class="security-status security-normal">
-            🔒 ОХРАНА: НОРМА (концевики замкнуты)
+        <button id="refreshBtn" onclick="refreshNodeData()">🔄 ОБНОВИТЬ ДАННЫЕ</button>
+        
+        <div class="section">
+            <div class="section-title">🔧 Мастерская</div>
+            <div class="section-info">MAC: AC:EB:E6:49:10:28</div>
+            
+            <div id="securityStatus" class="security-status security-normal">
+                🔒 ОХРАНА: НОРМА (концевики замкнуты)
+            </div>
+            
+            <button id="ledToggleBtn" class="led-unknown" onclick="toggleLED()">--</button>
+            <div class="clearfix"></div>
+            
+            <div id="nodeSensorData">
+                <p>Нажмите "Обновить данные" для получения показаний</p>
+            </div>
+            
+            <!-- БЛОК ВЕТРА -->
+            <div id="windBlock" class="wind-compact" onclick="toggleWindSize()" style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed #ccc;">
+                <div style="display: flex; align-items: center; margin-bottom: 8px;">
+                    <span style="font-weight: bold; color: #2c3e50; font-size: 1.1em;">🌪️ Ветер</span>
+                    <span id="magnetIndicator" style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-left: 8px; background-color: #95a5a6;"></span>
+                    <span id="magnetText" style="margin-left: 4px; font-size: 0.8em; color: #7f8c8d;">магнит</span>
+                </div>
+                
+                <div style="display: flex; align-items: center;">
+                    <div style="position: relative; width: 70px; height: 70px; flex-shrink: 0;">
+                        <div class="direction n">N</div>
+                        <div class="direction e">E</div>
+                        <div class="direction s">S</div>
+                        <div class="direction w">W</div>
+                        <svg viewBox="0 0 100 100">
+                            <circle cx="50" cy="50" r="48" fill="#ecf0f1" stroke="#34495e" stroke-width="1"/>
+                            <path id="windSector" d="" fill="#e74c3c" fill-opacity="0.7"/>
+                            <path id="windArrow" d="M50 10 L54 42 L50 50 L46 42 Z" fill="#2c3e50" stroke="white" stroke-width="1"/>
+                            <circle cx="50" cy="50" r="4" fill="#34495e" stroke="white" stroke-width="1"/>
+                        </svg>
+                    </div>
+                    
+                    <div style="margin-left: 12px;">
+                        <div>
+                            <span id="windAngle" style="font-size: 18px; font-weight: bold;">--</span>
+                            <span style="color: #7f8c8d;">°</span>
+                            <span id="stabilityBadge" class="wind-badge">ШТИЛЬ</span>
+                        </div>
+                        <div style="color: #7f8c8d; font-size: 11px; margin-top: 4px;">
+                            ±<span id="sectorWidth">--</span>°
+                            <span style="margin-left: 8px;" id="sectorRange">---</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
-        
-        <!-- КНОПКА LED - УВЕЛИЧЕНА -->
-        <button id="ledToggleBtn" class="led-unknown" onclick="toggleLED()">--</button>
-        <div style="clear: both;"></div>
-        
-        <!-- БЛОК ДЛЯ ДАННЫХ ДАТЧИКОВ -->
-        <div id="nodeSensorData">
-            <p>Нажмите "Обновить данные" для получения показаний</p>
+
+        <div class="section">
+            <div class="section-title">🌿 Теплица</div>
+            <div class="section-info">MAC: E8:9F:6D:87:34:8A</div>
+            <div class="sensor-grid" id="greenhouseData">
+                <div class="sensor-item">
+                    <span class="sensor-label">Температура (внутри):</span>
+                    <span class="sensor-value">--</span><span class="sensor-unit">°C</span>
+                </div>
+                <div class="sensor-item">
+                    <span class="sensor-label">Температура (улица):</span>
+                    <span class="sensor-value">--</span><span class="sensor-unit">°C</span>
+                </div>
+                <div class="sensor-item">
+                    <span class="sensor-label">Влажность (внутри):</span>
+                    <span class="sensor-value">--</span><span class="sensor-unit">%</span>
+                </div>
+                <div class="sensor-item">
+                    <span class="sensor-label">Реле 1 (основное):</span>
+                    <span id="relay1State" class="relay-status relay-off">--</span>
+                </div>
+                <div class="sensor-item">
+                    <span class="sensor-label">Реле 2 (доп.):</span>
+                    <span id="relay2State" class="relay-status relay-off">--</span>
+                </div>
+            </div>
+            <div id="lastUpdate">Ожидание данных от теплицы...</div>
         </div>
     </div>
 
-    <!-- Секция теплицы -->
-    <div class="section">
-        <div class="section-title">🌿 Теплица</div>
-        <div class="section-info">MAC: E8:9F:6D:87:34:8A</div>
-        <div class="sensor-grid" id="greenhouseData">
-            <div class="sensor-item">
-                <span class="sensor-label">Температура (внутри):</span>
-                <span class="sensor-value">--</span><span class="sensor-unit">°C</span>
+    <div id="windModal" class="wind-modal" onclick="toggleWindSize()">
+        <div class="wind-modal-content" onclick="event.stopPropagation()">
+            <div style="position: relative; width: 100%; height: 100%;">
+                <div class="direction n">N</div>
+                <div class="direction e">E</div>
+                <div class="direction s">S</div>
+                <div class="direction w">W</div>
+                <svg viewBox="0 0 100 100">
+                    <circle cx="50" cy="50" r="48" fill="#ecf0f1" stroke="#34495e" stroke-width="2"/>
+                    <path id="windSectorLarge" d="" fill="#e74c3c" fill-opacity="0.7"/>
+                    <path id="windArrowLarge" d="M50 10 L54 42 L50 50 L46 42 Z" fill="#2c3e50" stroke="white" stroke-width="1.5"/>
+                    <circle cx="50" cy="50" r="4" fill="#34495e" stroke="white" stroke-width="2"/>
+                </svg>
             </div>
-            <div class="sensor-item">
-                <span class="sensor-label">Температура (улица):</span>
-                <span class="sensor-value">--</span><span class="sensor-unit">°C</span>
-            </div>
-            <div class="sensor-item">
-                <span class="sensor-label">Влажность (внутри):</span>
-                <span class="sensor-value">--</span><span class="sensor-unit">%</span>
-            </div>
-            <div class="sensor-item">
-                <span class="sensor-label">Реле 1 (основное):</span>
-                <span id="relay1State" class="relay-status relay-off">--</span>
-            </div>
-            <div class="sensor-item">
-                <span class="sensor-label">Реле 2 (доп.):</span>
-                <span id="relay2State" class="relay-status relay-off">--</span>
+            <div style="text-align: center; margin-top: 20px;">
+                <span style="font-size: 32px; font-weight: bold;" id="windAngleLarge">--</span>
+                <span style="font-size: 20px; color: #7f8c8d;">°</span>
+                <span id="stabilityBadgeLarge" style="display: inline-block; padding: 8px 20px; border-radius: 20px; font-size: 16px; font-weight: bold; color: white; margin-left: 15px;">ШТИЛЬ</span>
+                <div style="margin-top: 15px; color: #7f8c8d; font-size: 18px;">
+                    ±<span id="sectorWidthLarge">--</span>° 
+                    <span style="margin-left: 20px;" id="sectorRangeLarge">---</span>
+                </div>
             </div>
         </div>
-        <div id="lastUpdate">Ожидание данных от теплицы...</div>
     </div>
 
     <script>
         const ws = new WebSocket('ws://' + window.location.hostname + '/ws');
-        let lastGreenhouseUpdate = null;
         let ledState = 'unknown';
         let buttonLocked = false;
-        let nodeConnectionActive = true;
-        let connectionCheckInterval = null;
-        let nodeDataStale = false;
-
-        // ================== АУДИО ДЛЯ ТРЕВОГИ И КОРОТКИХ СИГНАЛОВ ==================
         let audioContext = null;
         let alarmInterval = null;
-        let shortBeepTimer = null;
         let isAlarmPlaying = false;
         let alarmTimer = null;
 
-        // 1. Инициализация аудио при первом клике
-        function initAudioOnFirstTouch() {
+        function initAudio() {
             if (!audioContext) {
                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                console.log('AudioContext инициализирован');
-                document.removeEventListener('click', initAudioOnFirstTouch);
-                document.removeEventListener('touchstart', initAudioOnFirstTouch);
             }
         }
-        document.addEventListener('click', initAudioOnFirstTouch);
-        document.addEventListener('touchstart', initAudioOnFirstTouch);
+        document.addEventListener('click', initAudio);
 
-        // 2. СИРЕНА ТРЕВОГИ (10 секунд для охраны)
         function playAlarmTone() {
-            if (isAlarmPlaying) return;
-            if (!audioContext) initAudioOnFirstTouch();
+            if (isAlarmPlaying || !audioContext) return;
+            isAlarmPlaying = true;
             
-            try {
-                isAlarmPlaying = true;
-                console.log('Сирена тревоги активирована');
-                
-                function playAlarmPulse(freq, duration) {
-                    if (!audioContext) return;
-                    const oscillator = audioContext.createOscillator();
-                    const gainNode = audioContext.createGain();
-                    oscillator.connect(gainNode);
-                    gainNode.connect(audioContext.destination);
-                    oscillator.frequency.value = freq;
-                    oscillator.type = 'sawtooth';
-                    gainNode.gain.value = 0.15;
-                    oscillator.start();
-                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + duration);
-                    oscillator.stop(audioContext.currentTime + duration);
-                }
-                
-                alarmInterval = setInterval(() => {
-                    playAlarmPulse(800, 0.1);
-                    setTimeout(() => { playAlarmPulse(1200, 0.1); }, 150);
-                }, 500);
-                
-                // Автоматическая остановка через 10 секунд
-                alarmTimer = setTimeout(stopAlarmTone, 10000);
-                
-            } catch(e) {
-                console.log('Ошибка запуска сирены:', e);
-                isAlarmPlaying = false;
+            function playPulse(freq, dur) {
+                let osc = audioContext.createOscillator();
+                let gain = audioContext.createGain();
+                osc.connect(gain);
+                gain.connect(audioContext.destination);
+                osc.frequency.value = freq;
+                osc.type = 'sawtooth';
+                gain.gain.value = 0.15;
+                osc.start();
+                gain.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + dur);
+                osc.stop(audioContext.currentTime + dur);
             }
+            
+            alarmInterval = setInterval(() => {
+                playPulse(800, 0.1);
+                setTimeout(() => playPulse(1200, 0.1), 150);
+            }, 500);
+            
+            alarmTimer = setTimeout(stopAlarm, 10000);
         }
 
-        // 3. ОСТАНОВКА СИРЕНЫ
-        function stopAlarmTone() {
-            if (!isAlarmPlaying) return;
+        function stopAlarm() {
             isAlarmPlaying = false;
-            
-            if (alarmInterval) {
-                clearInterval(alarmInterval);
-                alarmInterval = null;
-            }
-            
-            if (alarmTimer) {
-                clearTimeout(alarmTimer);
-                alarmTimer = null;
-            }
-            
-            console.log('Сирена остановлена');
+            if (alarmInterval) clearInterval(alarmInterval);
+            if (alarmTimer) clearTimeout(alarmTimer);
+            alarmInterval = null;
+            alarmTimer = null;
         }
 
-        // 4. КОРОТКИЙ СИГНАЛ (2 секунды для потери связи)
         function playShortBeep() {
-            if (!audioContext) initAudioOnFirstTouch();
-            
-            try {
-                console.log('Воспроизведение короткого сигнала (2 секунды)');
-                
-                function playBeep(freq, duration) {
-                    if (!audioContext) return;
-                    const oscillator = audioContext.createOscillator();
-                    const gainNode = audioContext.createGain();
-                    oscillator.connect(gainNode);
-                    gainNode.connect(audioContext.destination);
-                    oscillator.frequency.value = freq;
-                    oscillator.type = 'sawtooth';
-                    gainNode.gain.value = 0.1;
-                    oscillator.start();
-                    gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + duration);
-                    oscillator.stop(audioContext.currentTime + duration);
-                }
-                
-                // 2 коротких гудка
-                playBeep(600, 0.2);
-                setTimeout(() => { playBeep(400, 0.3); }, 300);
-                
-            } catch(e) {
-                console.log('Ошибка воспроизведения короткого сигнала:', e);
+            if (!audioContext) return;
+            function beep(freq, dur) {
+                let osc = audioContext.createOscillator();
+                let gain = audioContext.createGain();
+                osc.connect(gain);
+                gain.connect(audioContext.destination);
+                osc.frequency.value = freq;
+                osc.type = 'sawtooth';
+                gain.gain.value = 0.1;
+                osc.start();
+                gain.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + dur);
+                osc.stop(audioContext.currentTime + dur);
             }
+            beep(600, 0.2);
+            setTimeout(() => beep(400, 0.3), 300);
         }
 
-        // ================== ОСНОВНАЯ ЛОГИКА ==================
-        ws.onopen = function() {
-            console.log('✅ WebSocket подключён');
-            updateLEDButton();
-            sendCommand('GET_STATUS');
-            
-            // Запускаем периодическую проверку связи
-            connectionCheckInterval = setInterval(() => {
-                if (nodeConnectionActive) {
-                    console.log('Проверка связи с узлом...');
-                    sendCommand('GET_STATUS');
-                }
-            }, 70000);
-        };
+        function toggleWindSize() {
+            let modal = document.getElementById('windModal');
+            if (modal.style.display === 'flex') {
+                modal.style.display = 'none';
+            } else {
+                modal.style.display = 'flex';
+                document.getElementById('windAngleLarge').textContent = document.getElementById('windAngle').textContent;
+                document.getElementById('sectorWidthLarge').textContent = document.getElementById('sectorWidth').textContent;
+                document.getElementById('sectorRangeLarge').innerHTML = document.getElementById('sectorRange').innerHTML;
+                
+                let badge = document.getElementById('stabilityBadge');
+                let badgeLarge = document.getElementById('stabilityBadgeLarge');
+                badgeLarge.textContent = badge.textContent;
+                badgeLarge.style.backgroundColor = badge.style.backgroundColor;
+                
+                let sector = document.getElementById('windSector');
+                let sectorLarge = document.getElementById('windSectorLarge');
+                sectorLarge.setAttribute('d', sector.getAttribute('d'));
+                
+                let arrow = document.getElementById('windArrow');
+                let arrowLarge = document.getElementById('windArrowLarge');
+                arrowLarge.setAttribute('transform', arrow.getAttribute('transform'));
+            }
+        }
 
         function updateLEDButton() {
-            const btn = document.getElementById('ledToggleBtn');
-            
+            let btn = document.getElementById('ledToggleBtn');
             if (ledState === 'on') {
                 btn.textContent = '⏸ ВЫКЛЮЧИТЬ LED';
                 btn.className = 'led-on';
@@ -497,222 +582,197 @@ void setup() {
         }
 
         function toggleLED() {
-            if (buttonLocked || ws.readyState !== WebSocket.OPEN) {
-                console.log('Кнопка заблокирована или нет связи');
-                return;
-            }
-            
-            const btn = document.getElementById('ledToggleBtn');
-            const newCmd = (ledState === 'on') ? 'LED_OFF' : 'LED_ON';
-            
-            console.log('Отправка команды:', newCmd, 'Текущее состояние:', ledState);
-            
+            if (buttonLocked || ws.readyState !== WebSocket.OPEN) return;
+            let cmd = (ledState === 'on') ? 'LED_OFF' : 'LED_ON';
             buttonLocked = true;
+            let btn = document.getElementById('ledToggleBtn');
             btn.disabled = true;
-            btn.style.opacity = '0.7';
-            
-            setTimeout(() => {
-                if (buttonLocked) {
-                    console.log('Таймаут: подтверждение не получено');
-                    buttonLocked = false;
-                    updateLEDButton();
-                }
-            }, 5000);
-            
-            ws.send(JSON.stringify({command: newCmd}));
+            setTimeout(() => { buttonLocked = false; updateLEDButton(); }, 5000);
+            ws.send(JSON.stringify({command: cmd}));
         }
 
         function refreshNodeData() {
-            console.log('Принудительное обновление данных узла');
-            clearNodeData();
-            sendCommand('GET_STATUS');
-        }
-
-        function clearNodeData() {
-            console.log('Очистка данных узла на веб-странице');
-            ledState = 'unknown';
-            nodeConnectionActive = false;
-            updateLEDButton();
             document.getElementById('nodeSensorData').innerHTML = 
-                '<p style="color:#e74c3c;">⏳ Запрос данных отправлен. Ожидание ответа...</p>';
+                '<p style="color:#e74c3c;">⏳ Запрос данных отправлен...</p>';
+            ws.send(JSON.stringify({command: 'GET_STATUS'}));
         }
 
-        // ПОМЕТИТЬ ДАННЫЕ УЗЛА КАК УСТАРЕВШИЕ (красный цвет)
         function markNodeDataAsStale() {
-            // Применяем стили устаревания к элементам датчиков
-            const sensorItems = document.querySelectorAll('#nodeSensorData .sensor-item');
-            sensorItems.forEach(item => {
-                item.classList.add('stale-data');
-            });
-            
-            const sensorValues = document.querySelectorAll('#nodeSensorData .sensor-value');
-            sensorValues.forEach(value => {
-                value.classList.add('stale-data');
-            });
-            
-            // Воспроизводим короткий звуковой сигнал
+            let items = document.querySelectorAll('#nodeSensorData .sensor-item');
+            items.forEach(i => i.classList.add('stale-data'));
+            let vals = document.querySelectorAll('#nodeSensorData .sensor-value');
+            vals.forEach(v => v.classList.add('stale-data'));
             playShortBeep();
         }
 
-        // ВОССТАНОВИТЬ НОРМАЛЬНЫЙ ВИД ДАННЫХ
         function markNodeDataAsFresh() {
-            // Убираем стили устаревания
-            const sensorItems = document.querySelectorAll('#nodeSensorData .sensor-item');
-            sensorItems.forEach(item => {
-                item.classList.remove('stale-data');
-            });
-            
-            const sensorValues = document.querySelectorAll('#nodeSensorData .sensor-value');
-            sensorValues.forEach(value => {
-                value.classList.remove('stale-data');
-            });
+            let items = document.querySelectorAll('#nodeSensorData .sensor-item');
+            items.forEach(i => i.classList.remove('stale-data'));
+            let vals = document.querySelectorAll('#nodeSensorData .sensor-value');
+            vals.forEach(v => v.classList.remove('stale-data'));
         }
 
-        function sendCommand(cmd) {
-            if (ws.readyState !== WebSocket.OPEN) {
-                console.log('Нет связи с WebSocket');
-                return;
-            }
-            ws.send(JSON.stringify({command: cmd}));
-            console.log('Отправлена команда:', cmd);
-        }
-
-        function updateSecurityStatus(alarm, contact1, contact2) {
-            const securityElement = document.getElementById('securityStatus');
-            
+        function updateSecurityStatus(alarm, c1, c2) {
+            let el = document.getElementById('securityStatus');
             if (alarm) {
-                securityElement.className = 'security-status security-alarm';
-                let statusText = '🚨 ТРЕВОГА! ';
-                if (contact1 && contact2) {
-                    statusText += 'ОБА КОНЦЕВИКА РАЗОРВАНЫ!';
-                } else if (contact1) {
-                    statusText += 'Концевик 1 разорван';
-                } else if (contact2) {
-                    statusText += 'Концевик 2 разорван';
-                } else {
-                    statusText += 'Неизвестное состояние';
-                }
-                securityElement.innerHTML = statusText;
-                
-                // Включаем звуковую сирену
+                el.className = 'security-status security-alarm';
+                let txt = '🚨 ТРЕВОГА! ';
+                if (c1 && c2) txt += 'ОБА КОНЦЕВИКА!';
+                else if (c1) txt += 'Концевик 1 разорван';
+                else if (c2) txt += 'Концевик 2 разорван';
+                el.innerHTML = txt;
                 playAlarmTone();
             } else {
-                securityElement.className = 'security-status security-normal';
-                let statusText = '🔒 ОХРАНА: НОРМА';
-                if (contact1 !== undefined && contact2 !== undefined) {
-                    statusText += ` (концевик 1: ${contact1 ? 'разомкнут' : 'замкнут'}, концевик 2: ${contact2 ? 'разомкнут' : 'замкнут'})`;
-                }
-                securityElement.innerHTML = statusText;
-                
-                // Останавливаем сирену, если она играет
-                stopAlarmTone();
+                el.className = 'security-status security-normal';
+                el.innerHTML = '🔒 ОХРАНА: НОРМА';
+                stopAlarm();
             }
+        }
+
+        function drawWindSectorAndArrow(start, end, angle) {
+            function draw(pathId, s, e) {
+                let path = document.getElementById(pathId);
+                if (!path) return;
+                let cx = 50, cy = 50, r = 48;
+                
+                function degToRad(d) {
+                    return (d - 90) * Math.PI / 180;
+                }
+                
+                let startRad = degToRad(s);
+                let endRad = degToRad(e);
+                
+                let x1 = cx + r * Math.cos(startRad);
+                let y1 = cy + r * Math.sin(startRad);
+                let x2 = cx + r * Math.cos(endRad);
+                let y2 = cy + r * Math.sin(endRad);
+                
+                let angleDiff = e - s;
+                if (angleDiff < 0) angleDiff += 360;
+                let largeArc = angleDiff > 180 ? 1 : 0;
+                
+                let d = `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2} Z`;
+                path.setAttribute('d', d);
+            }
+            
+            draw('windSector', start, end);
+            if (document.getElementById('windSectorLarge')) {
+                draw('windSectorLarge', start, end);
+            }
+            
+            function rotate(arrowId, deg) {
+                let arrow = document.getElementById(arrowId);
+                if (arrow) {
+                    arrow.setAttribute('transform', `rotate(${deg}, 50, 50)`);
+                }
+            }
+            
+            rotate('windArrow', angle);
+            rotate('windArrowLarge', angle);
         }
 
         ws.onmessage = function(event) {
-            const msg = JSON.parse(event.data);
-            console.log('Получено:', msg.type);
-
+            let msg = JSON.parse(event.data);
+            
             if (msg.type === 'node_status') {
-                console.log('Получен статус LED:', msg.state);
                 ledState = msg.state;
                 buttonLocked = false;
                 updateLEDButton();
             }
             else if (msg.type === 'sensor_data') {
-                // ТОЛЬКО данные датчиков, БЕЗ информации о GPIO
                 let html = '<div class="sensor-grid">';
                 if (msg.aht20) {
-                    html += `<div class="sensor-item"><span class="sensor-label">AHT20 (t):</span><span class="sensor-value">${msg.aht20.temp}</span><span class="sensor-unit">°C</span></div>`;
-                    html += `<div class="sensor-item"><span class="sensor-label">AHT20 (h):</span><span class="sensor-value">${msg.aht20.hum}</span><span class="sensor-unit">%</span></div>`;
+                    html += `<div class="sensor-item"><span class="sensor-label">AHT20:</span><span class="sensor-value">${msg.aht20.temp}</span><span class="sensor-unit">°C</span></div>`;
+                    html += `<div class="sensor-item"><span class="sensor-label">AHT20:</span><span class="sensor-value">${msg.aht20.hum}</span><span class="sensor-unit">%</span></div>`;
                 }
                 if (msg.bmp280) {
-                    html += `<div class="sensor-item"><span class="sensor-label">BMP280 (t):</span><span class="sensor-value">${msg.bmp280.temp}</span><span class="sensor-unit">°C</span></div>`;
-                    html += `<div class="sensor-item"><span class="sensor-label">BMP280 (p):</span><span class="sensor-value">${msg.bmp280.press}</span><span class="sensor-unit">mmHg</span></div>`;
+                    html += `<div class="sensor-item"><span class="sensor-label">BMP280:</span><span class="sensor-value">${msg.bmp280.temp}</span><span class="sensor-unit">°C</span></div>`;
+                    html += `<div class="sensor-item"><span class="sensor-label">BMP280:</span><span class="sensor-value">${msg.bmp280.press}</span><span class="sensor-unit">mmHg</span></div>`;
                 }
                 html += '</div>';
                 document.getElementById('nodeSensorData').innerHTML = html;
-                
-                if (ledState === 'unknown') {
-                    sendCommand('GET_STATUS');
-                }
             }
             else if (msg.type === 'security') {
-                // ОБРАБОТКА СТАТУСА ОХРАНЫ
-                console.log('Статус охраны:', msg.alarm);
                 updateSecurityStatus(msg.alarm, msg.contact1, msg.contact2);
             }
             else if (msg.type === 'connection_lost') {
-                // Хаб сообщает о потере связи с узлом
-                console.log('Хаб сообщает: связь с узлом потеряна');
                 markNodeDataAsStale();
-                nodeDataStale = true;
             }
             else if (msg.type === 'connection_restored') {
-                // Хаб сообщает о восстановлении связи с узлом
-                console.log('Хаб сообщает: связь с узлом восстановлена');
                 markNodeDataAsFresh();
-                nodeDataStale = false;
             }
             else if (msg.type === 'gpio_status') {
-                // ТОЛЬКО обновляем состояние LED, НЕ выводим блок GPIO
                 if (msg.gpio8 !== undefined) {
                     ledState = msg.gpio8 ? 'on' : 'off';
                     updateLEDButton();
                 }
             }
             else if (msg.type === 'greenhouse_data') {
-                lastGreenhouseUpdate = new Date();
+                let vals = document.querySelectorAll('#greenhouseData .sensor-value');
+                if (vals.length >= 3) {
+                    vals[0].textContent = msg.temp_in;
+                    vals[1].textContent = msg.temp_out;
+                    vals[2].textContent = msg.hum_in;
+                }
+                let r1 = document.getElementById('relay1State');
+                let r2 = document.getElementById('relay2State');
+                r1.textContent = (msg.relay1_state == 1) ? 'ВКЛЮЧЕНО' : 'ВЫКЛЮЧЕНО';
+                r1.className = (msg.relay1_state == 1) ? 'relay-status relay-on' : 'relay-status relay-off';
+                r2.textContent = (msg.relay2_state == 1) ? 'ВКЛЮЧЕНО' : 'ВЫКЛЮЧЕНО';
+                r2.className = (msg.relay2_state == 1) ? 'relay-status relay-on' : 'relay-status relay-off';
+                document.getElementById('lastUpdate').textContent = `Обновлено: ${new Date().toLocaleTimeString()}`;
+            }
+            else if (msg.type === 'wind') {
+                document.getElementById('windAngle').textContent = msg.angle_avg;
+                document.getElementById('sectorWidth').textContent = msg.sector_width;
+                document.getElementById('sectorRange').innerHTML = `${msg.sector_start}° - ${msg.sector_end}°`;
                 
-                const greenhouseData = document.querySelectorAll('#greenhouseData .sensor-value');
-                if (greenhouseData.length >= 3) {
-                    greenhouseData[0].textContent = msg.temp_in;
-                    greenhouseData[1].textContent = msg.temp_out;
-                    greenhouseData[2].textContent = msg.hum_in;
+                if (document.getElementById('windModal').style.display === 'flex') {
+                    document.getElementById('windAngleLarge').textContent = msg.angle_avg;
+                    document.getElementById('sectorWidthLarge').textContent = msg.sector_width;
+                    document.getElementById('sectorRangeLarge').innerHTML = `${msg.sector_start}° - ${msg.sector_end}°`;
                 }
                 
-                // ОБНОВЛЯЕМ статусы реле КАЖДЫЙ раз при получении данных
-                updateRelayDisplay('relay1State', msg.relay1_state);
-                updateRelayDisplay('relay2State', msg.relay2_state);
+                let magnet = document.getElementById('magnetIndicator');
+                let magnetText = document.getElementById('magnetText');
+                if (msg.magnet) {
+                    magnet.style.backgroundColor = '#27ae60';
+                    magnetText.textContent = 'магнит есть';
+                    magnetText.style.color = '#27ae60';
+                } else {
+                    magnet.style.backgroundColor = '#e74c3c';
+                    magnetText.textContent = 'магнит нет';
+                    magnetText.style.color = '#e74c3c';
+                }
                 
-                document.getElementById('lastUpdate').textContent = `Обновлено: ${lastGreenhouseUpdate.toLocaleTimeString()}`;
+                let badge = document.getElementById('stabilityBadge');
+                let badgeLarge = document.getElementById('stabilityBadgeLarge');
+                badge.textContent = 'ШТИЛЬ';
+                badge.style.backgroundColor = '#3498db';
+                if (badgeLarge) {
+                    badgeLarge.textContent = 'ШТИЛЬ';
+                    badgeLarge.style.backgroundColor = '#3498db';
+                }
+                
+                drawWindSectorAndArrow(
+                    parseFloat(msg.sector_start), 
+                    parseFloat(msg.sector_end), 
+                    parseFloat(msg.angle_avg)
+                );
             }
         };
 
-        function updateRelayDisplay(elementId, state) {
-            const element = document.getElementById(elementId);
-            if (state === 1 || state === '1') {
-                element.textContent = 'ВКЛЮЧЕНО';
-                element.className = 'relay-status relay-on';
-            } else {
-                element.textContent = 'ВЫКЛЮЧЕНО';
-                element.className = 'relay-status relay-off';
-            }
-        }
-
-        function updateTimeAgo() {
-            if (lastGreenhouseUpdate) {
-                const secondsAgo = Math.floor((new Date() - lastGreenhouseUpdate) / 1000);
-                const elem = document.getElementById('lastUpdate');
-                if (secondsAgo < 60) {
-                    elem.textContent = `Обновлено: ${secondsAgo} сек. назад`;
-                } else {
-                    elem.textContent = `Обновлено: ${lastGreenhouseUpdate.toLocaleTimeString()}`;
-                }
-            }
-        }
-        
-        setInterval(updateTimeAgo, 1000);
-        updateLEDButton();
+        ws.onopen = function() {
+            updateLEDButton();
+            ws.send(JSON.stringify({command: 'GET_STATUS'}));
+        };
 
         ws.onclose = function() {
-            console.log('WebSocket отключен');
             ledState = 'unknown';
             updateLEDButton();
-            if (connectionCheckInterval) {
-                clearInterval(connectionCheckInterval);
-            }
         };
+
+        updateLEDButton();
     </script>
 </body>
 </html>
@@ -757,70 +817,45 @@ void setup() {
     Serial.println("\n=== ХАБ ГОТОВ К РАБОТЕ ===");
     Serial.println("1. Подключитесь к Wi-Fi: " + String(AP_SSID));
     Serial.println("2. Откройте: http://" + WiFi.softAPIP().toString());
-    Serial.println("3. Контроль связи: автоматически каждые 70 сек");
-    Serial.println("4. Устаревшие данные окрашиваются в красный\n");
+    Serial.println("3. Ветер: две точки, векторное среднее, сектор = разница\n");
 }
 
 void loop() {
     ws.cleanupClients();
-    
-    // Проверяем связь с узлом каждую секунду
     checkNodeConnection();
-    
-    // Обновляем состояние звуковой тревоги
     updateAlarmState();
     
-    delay(1000);
-}
-
-// НОВАЯ ФУНКЦИЯ: Отправка статуса соединения в веб-интерфейс
-void sendConnectionStatusToWeb(bool connected) {
-    StaticJsonDocument<100> doc;
-    if (connected) {
-        doc["type"] = "connection_restored";
-        Serial.println("📡 Связь с узлом восстановлена - отправка в веб");
-    } else {
-        doc["type"] = "connection_lost";
-        Serial.println("⚠️  Связь с узлом потеряна - отправка в веб");
+    unsigned long now = millis();
+    if (now - lastEncoderBroadcastTime >= ENCODER_BROADCAST_INTERVAL) {
+        broadcastEncoderData();
+        lastEncoderBroadcastTime = now;
     }
     
-    String jsonResponse;
-    serializeJson(doc, jsonResponse);
-    ws.textAll(jsonResponse);
+    delay(100);
+}
+
+void sendConnectionStatusToWeb(bool connected) {
+    StaticJsonDocument<100> doc;
+    doc["type"] = connected ? "connection_restored" : "connection_lost";
+    String json;
+    serializeJson(doc, json);
+    ws.textAll(json);
 }
 
 void checkNodeConnection() {
-    unsigned long currentTime = millis();
-    
-    // Проверяем, когда последний раз были данные от узла
+    unsigned long now = millis();
     if (lastNodeDataTime > 0) {
-        unsigned long timeSinceLastData = currentTime - lastNodeDataTime;
-        
-        if (timeSinceLastData > NODE_TIMEOUT_MS) {
-            // Связь потеряна - прошло больше 70 секунд
+        if (now - lastNodeDataTime > NODE_TIMEOUT_MS) {
             if (!nodeConnectionLost) {
                 nodeConnectionLost = true;
-                connectionLostTime = currentTime;
-                
-                Serial.println("⚠️  СВЯЗЬ С УЗЛОМ ПОТЕРЯНА!");
-                Serial.printf("   Последние данные были %lu секунд назад\n", timeSinceLastData / 1000);
-                
-                // Отправляем сообщение в веб-интерфейс о потере связи
+                connectionLostTime = now;
+                Serial.println("⚠️ СВЯЗЬ С УЗЛОМ ПОТЕРЯНА!");
                 sendConnectionStatusToWeb(false);
             }
-            
-            // Проверяем кулдаун для звукового сигнала
-            if ((currentTime - connectionLostTime) > CONNECTION_LOST_COOLDOWN) {
-                connectionLostTime = currentTime; // Сбрасываем таймер
-                Serial.println("   🔔 Короткий звуковой сигнал отправлен в веб");
-            }
         } else {
-            // Связь активна
             if (nodeConnectionLost) {
                 nodeConnectionLost = false;
                 Serial.println("✅ СВЯЗЬ С УЗЛОМ ВОССТАНОВЛЕНА!");
-                
-                // Отправляем сообщение в веб-интерфейс о восстановлении связи
                 sendConnectionStatusToWeb(true);
             }
         }
@@ -828,10 +863,8 @@ void checkNodeConnection() {
 }
 
 void updateAlarmState() {
-    // Автоматическое отключение тревоги через 10 секунд
     if (securityAlarmActive && (millis() - alarmStartTime) > ALARM_DURATION_MS) {
         securityAlarmActive = false;
-        Serial.println("🔄 Автоматическое отключение тревоги (10 секунд прошло)");
     }
 }
 
@@ -839,12 +872,8 @@ void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                      AwsEventType type, void *arg, uint8_t *data, size_t len) {
     if (type == WS_EVT_DATA) {
         StaticJsonDocument<200> doc;
-        DeserializationError error = deserializeJson(doc, data, len);
-        if (!error && doc.containsKey("command")) {
-            String cmd = doc["command"].as<String>();
-            Serial.print("📨 Веб-команда: ");
-            Serial.println(cmd);
-            sendToNode(cmd);
+        if (!deserializeJson(doc, data, len) && doc.containsKey("command")) {
+            sendToNode(doc["command"].as<String>());
         }
     }
 }
@@ -852,206 +881,210 @@ void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
 void sendToNode(String cmd) {
     char json_cmd[64];
     snprintf(json_cmd, sizeof(json_cmd), "{\"type\":\"command\",\"command\":\"%s\"}", cmd.c_str());
-
     strncpy(outgoingMessage.json, json_cmd, sizeof(outgoingMessage.json)-1);
     outgoingMessage.json[sizeof(outgoingMessage.json)-1] = '\0';
     outgoingMessage.sender_id = 1;
-
-    esp_err_t result = esp_now_send(nodeMacAddress, (uint8_t *) &outgoingMessage, sizeof(outgoingMessage));
-
-    if (result == ESP_OK) {
-        Serial.print("📡 Отправлена команда на узел: ");
-        Serial.println(cmd);
-    } else {
-        Serial.print("❌ Ошибка отправки: ");
-        Serial.println(result);
-    }
+    esp_now_send(nodeMacAddress, (uint8_t*)&outgoingMessage, sizeof(outgoingMessage));
 }
 
-void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-    char macStr[18];
-    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-    Serial.printf("✉️ Доставка для %s: ", macStr);
-    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "✅ Успех" : "❌ Ошибка");
-}
+void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
 
 void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
-    char macStr[18];
-    snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
-
-    uint8_t nodeMac[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
-    if (memcmp(mac_addr, nodeMac, 6) == 0) {
-        Serial.printf("\n📥 Пакет от мастерской (%s), длина: %d байт\n", macStr, len);
-        lastNodeDataTime = millis();  // Обновляем время последних данных
+    if (memcmp(mac_addr, nodeMacAddress, 6) == 0) {
+        lastNodeDataTime = millis();
         processNodeData(incomingData, len);
-        return;
     }
-
-    uint8_t greenhouseMac[] = {0xE8, 0x9F, 0x6D, 0x87, 0x34, 0x8A};
-    if (memcmp(mac_addr, greenhouseMac, 6) == 0) {
-        Serial.printf("\n🌿 Пакет от теплицы (%s), длина: %d байт\n", macStr, len);
-        
+    else if (memcmp(mac_addr, greenhouseMac, 6) == 0) {
         if (len == sizeof(greenhouse_packet)) {
             processGreenhouseData(incomingData);
-        } else {
-            Serial.printf("❌ Неожиданная длина пакета! Ожидалось %d, получено %d\n", 
-                         sizeof(greenhouse_packet), len);
         }
-        return;
     }
-
-    Serial.printf("[ХАБ] Игнорирую неизвестное устройство: %s\n", macStr);
 }
 
 void processNodeData(const uint8_t *data, int len) {
-    if (len <= sizeof(incomingMessage)) {
-        memcpy(&incomingMessage, data, len);
-    } else {
-        Serial.println("❌ Пакет от узла слишком большой!");
+    if (len > sizeof(incomingMessage)) {
+        Serial.println("❌ Пакет слишком большой!");
         return;
     }
     
-    Serial.print("📥 JSON от мастерской: ");
-    Serial.println(incomingMessage.json);
-
+    memcpy(&incomingMessage, data, len);
+    
     StaticJsonDocument<256> doc;
     DeserializationError error = deserializeJson(doc, incomingMessage.json);
-    
     if (error) {
-        Serial.print("❌ Ошибка парсинга JSON: ");
+        Serial.print("❌ JSON ошибка: ");
         Serial.println(error.c_str());
         return;
     }
-    
+
     const char* type = doc["type"];
-    
+
     if (strcmp(type, "sensor") == 0) {
         JsonObject dataObj = doc["data"];
-        StaticJsonDocument<300> response;
-        response["type"] = "sensor_data";
-        
+        StaticJsonDocument<300> resp;
+        resp["type"] = "sensor_data";
         if (dataObj.containsKey("AHT20")) {
-            response["aht20"]["temp"] = dataObj["AHT20"]["temp"].as<String>();
-            response["aht20"]["hum"] = dataObj["AHT20"]["hum"].as<String>();
+            resp["aht20"]["temp"] = dataObj["AHT20"]["temp"].as<String>();
+            resp["aht20"]["hum"] = dataObj["AHT20"]["hum"].as<String>();
         }
         if (dataObj.containsKey("BMP280")) {
-            response["bmp280"]["temp"] = dataObj["BMP280"]["temp"].as<String>();
-            response["bmp280"]["press"] = dataObj["BMP280"]["press_mmHg"].as<String>();
+            resp["bmp280"]["temp"] = dataObj["BMP280"]["temp"].as<String>();
+            resp["bmp280"]["press"] = dataObj["BMP280"]["press_mmHg"].as<String>();
         }
-        
-        String jsonResponse;
-        serializeJson(response, jsonResponse);
-        ws.textAll(jsonResponse);
-        Serial.println("📊 Данные с датчиков отправлены в веб-интерфейс.");
+        String json;
+        serializeJson(resp, json);
+        ws.textAll(json);
     }
     else if (strcmp(type, "security") == 0) {
-        // ОБРАБОТКА СТАТУСА ОХРАНЫ
         bool alarm = doc["alarm"];
-        bool contact1 = doc["contact1"];
-        bool contact2 = doc["contact2"];
+        bool c1 = doc["contact1"];
+        bool c2 = doc["contact2"];
         
-        // Активируем тревогу на хабе
         if (alarm && !securityAlarmActive) {
             securityAlarmActive = true;
             alarmStartTime = millis();
-            Serial.println("🚨 АКТИВАЦИЯ ТРЕВОГИ НА ХАБЕ!");
+            Serial.println("🚨 ТРЕВОГА!");
         } else if (!alarm) {
             securityAlarmActive = false;
         }
         
-        StaticJsonDocument<200> response;
-        response["type"] = "security";
-        response["alarm"] = alarm;
-        response["contact1"] = contact1;
-        response["contact2"] = contact2;
-        
-        String jsonResponse;
-        serializeJson(response, jsonResponse);
-        ws.textAll(jsonResponse);
-        
-        Serial.printf("🚨 Статус охраны: alarm=%d, contact1=%d, contact2=%d\n", 
-                     alarm, contact1, contact2);
+        StaticJsonDocument<200> resp;
+        resp["type"] = "security";
+        resp["alarm"] = alarm;
+        resp["contact1"] = c1;
+        resp["contact2"] = c2;
+        String json;
+        serializeJson(resp, json);
+        ws.textAll(json);
     }
     else if (strcmp(type, "ack") == 0) {
         const char* cmd = doc["command"];
-        const char* status = doc["status"];
-        
-        Serial.printf("✅ Подтверждение от мастерской: команда '%s', статус '%s'\n", cmd, status);
-        
         if (strcmp(cmd, "LED_ON") == 0) {
-            StaticJsonDocument<200> response;
-            response["type"] = "node_status";
-            response["state"] = "on";
-            String jsonResponse;
-            serializeJson(response, jsonResponse);
-            ws.textAll(jsonResponse);
+            StaticJsonDocument<200> resp;
+            resp["type"] = "node_status";
+            resp["state"] = "on";
+            String json;
+            serializeJson(resp, json);
+            ws.textAll(json);
         }
         else if (strcmp(cmd, "LED_OFF") == 0) {
-            StaticJsonDocument<200> response;
-            response["type"] = "node_status";
-            response["state"] = "off";
-            String jsonResponse;
-            serializeJson(response, jsonResponse);
-            ws.textAll(jsonResponse);
+            StaticJsonDocument<200> resp;
+            resp["type"] = "node_status";
+            resp["state"] = "off";
+            String json;
+            serializeJson(resp, json);
+            ws.textAll(json);
         }
     }
     else if (strcmp(type, "gpio") == 0) {
-        // Отправляем только данные о состоянии GPIO для обновления кнопки
-        StaticJsonDocument<200> response;
-        response["type"] = "gpio_status";
-        
+        StaticJsonDocument<200> resp;
+        resp["type"] = "gpio_status";
         if (doc.containsKey("pin") && doc.containsKey("state")) {
             int pin = doc["pin"];
             int state = doc["state"];
-            if (pin == 8) {
-                response["gpio8"] = state;
-            }
+            if (pin == 8) resp["gpio8"] = state;
         }
+        String json;
+        serializeJson(resp, json);
+        ws.textAll(json);
+    }
+    else if (strcmp(type, "encoder") == 0) {
+        float angle = doc["angle"];
+        bool magnet = doc["magnet"];
         
-        String jsonResponse;
-        serializeJson(response, jsonResponse);
-        ws.textAll(jsonResponse);
+        if (magnet) {
+            processEncoderData(angle, true);
+        }
     }
 }
 
 void processGreenhouseData(const uint8_t *data) {
-    greenhouse_packet packet;
-    memcpy(&packet, data, sizeof(greenhouse_packet));
+    greenhouse_packet pkt;
+    memcpy(&pkt, data, sizeof(pkt));
 
     unsigned long now = millis();
     if (now - lastGreenhouseUpdate < GREENHOUSE_UPDATE_INTERVAL) {
-        Serial.println("⚠️  Данные теплицы не отправлены в веб (частое обновление)");
         return;
     }
     lastGreenhouseUpdate = now;
 
-    char temp_in_str[5] = {0};
-    char temp_out_str[5] = {0};
-    strncpy(temp_in_str, packet.temp_in, 4);
-    strncpy(temp_out_str, packet.temp_out, 4);
+    char temp_in[5] = {0};
+    char temp_out[5] = {0};
+    strncpy(temp_in, pkt.temp_in, 4);
+    strncpy(temp_out, pkt.temp_out, 4);
 
-    StaticJsonDocument<300> response;
-    response["type"] = "greenhouse_data";
-    response["temp_in"] = temp_in_str;
-    response["temp_out"] = temp_out_str;
-    response["hum_in"] = packet.hum_in;
-    response["relay1_state"] = packet.relay1_state;
-    response["relay2_state"] = packet.relay2_state;
+    StaticJsonDocument<300> resp;
+    resp["type"] = "greenhouse_data";
+    resp["temp_in"] = temp_in;
+    resp["temp_out"] = temp_out;
+    resp["hum_in"] = pkt.hum_in;
+    resp["relay1_state"] = pkt.relay1_state;
+    resp["relay2_state"] = pkt.relay2_state;
 
-    String jsonResponse;
-    serializeJson(response, jsonResponse);
-    ws.textAll(jsonResponse);
-
-    Serial.println("✅ Данные теплицы обработаны и отправлены в веб:");
-    Serial.printf("   Температура внутри: %s °C\n", temp_in_str);
-    Serial.printf("   Температура улица:  %s °C\n", temp_out_str);
-    Serial.printf("   Влажность внутри:   %u %%\n", packet.hum_in);
-    Serial.printf("   Реле 1:             %s\n", relayStateToString(packet.relay1_state).c_str());
-    Serial.printf("   Реле 2:             %s\n", relayStateToString(packet.relay2_state).c_str());
+    String json;
+    serializeJson(resp, json);
+    ws.textAll(json);
 }
 
 String relayStateToString(uint32_t state) {
     return (state == 1) ? "ВКЛЮЧЕНО" : "ВЫКЛЮЧЕНО";
+}
+
+// ========== ВЕТЕР: ДВЕ ТОЧКИ, ВЕКТОРНОЕ СРЕДНЕЕ ==========
+void processEncoderData(float angle, bool magnet) {
+    if (prevEncoderAngle < 0) {
+        prevEncoderAngle = angle;
+        currentEncoderAngle = angle;
+        windDirection = angle;
+        windSector = 0.0;
+        Serial.printf("🌪️ Ветер: первое значение %.1f°\n", angle);
+    } else {
+        prevEncoderAngle = currentEncoderAngle;
+        currentEncoderAngle = angle;
+        
+        float rad1 = radians(prevEncoderAngle);
+        float rad2 = radians(currentEncoderAngle);
+        float sumSin = sin(rad1) + sin(rad2);
+        float sumCos = cos(rad1) + cos(rad2);
+        float meanRad = atan2(sumSin, sumCos);
+        windDirection = degrees(meanRad);
+        if (windDirection < 0) windDirection += 360.0;
+        
+        float diff = fmod(currentEncoderAngle - prevEncoderAngle + 540.0, 360.0) - 180.0;
+        windSector = fabs(diff);
+        
+        Serial.printf("🌪️ Ветер: prev=%.1f°, curr=%.1f°, напр=%.1f°, сектор=%.1f°\n", 
+                      prevEncoderAngle, currentEncoderAngle, windDirection, windSector);
+    }
+    
+    windMagnet = magnet;
+    broadcastEncoderData();
+}
+
+void broadcastEncoderData() {
+    if (prevEncoderAngle < 0) return;
+    
+    float start = windDirection - windSector / 2;
+    float end = windDirection + windSector / 2;
+    
+    start = fmod(fmod(start, 360) + 360, 360);
+    end = fmod(fmod(end, 360) + 360, 360);
+    
+    bool crossZero = (windSector > 0 && 
+                     ((prevEncoderAngle > 270 && currentEncoderAngle < 90) || 
+                      (prevEncoderAngle < 90 && currentEncoderAngle > 270)));
+    
+    StaticJsonDocument<256> doc;
+    doc["type"] = "wind";
+    doc["angle_avg"] = serialized(String(windDirection, 1));
+    doc["sector_width"] = serialized(String(windSector, 1));
+    doc["sector_start"] = serialized(String(start, 0));
+    doc["sector_end"] = serialized(String(end, 0));
+    doc["cross_zero"] = crossZero;
+    doc["magnet"] = windMagnet;
+    doc["stability"] = "calm";
+    
+    String json;
+    serializeJson(doc, json);
+    ws.textAll(json);
 }
