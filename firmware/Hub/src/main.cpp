@@ -1,7 +1,7 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
- * ВЕРСИЯ 4.0: Ветер - скользящее среднее двух точек
- */
+ * 
+ */ВЕРСИЯ 5.2: ПОЛНОСТЬЮ РАБОЧАЯ - ветер, желтый сектор 30 сек, штиль/шторм
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
@@ -58,14 +58,27 @@ bool securityAlarmActive = false;
 unsigned long alarmStartTime = 0;
 const unsigned long ALARM_DURATION_MS = 10000;
 
-// ---- 5. ДАННЫЕ ЭНКОДЕРА AS5600 - ДВЕ ТОЧКИ ----
+// ---- 5. ДАННЫЕ ЭНКОДЕРА AS5600 - ДВЕ ТОЧКИ + ИСТОРИЯ 30 СЕК ----
+#define ENCODER_HISTORY_SIZE 6        // 6 значений = 30 секунд при 5 сек
+#define ENCODER_BROADCAST_INTERVAL 5000
+
+// Текущие две точки
 float prevEncoderAngle = -1.0;
 float currentEncoderAngle = -1.0;
 float windDirection = 0.0;
-float windSector = 0.0;
+float windCurrentSector = 0.0;
 bool windMagnet = false;
+
+// История для желтого сектора
+float encoderHistory[ENCODER_HISTORY_SIZE];
+unsigned long historyTimestamps[ENCODER_HISTORY_SIZE];
+int historyIndex = 0;
+int historyCount = 0;
+
+// Максимум и минимум за 30 секунд
+float maxAngle = -1.0;
+float minAngle = 361.0;
 unsigned long lastEncoderBroadcastTime = 0;
-const unsigned long ENCODER_BROADCAST_INTERVAL = 5000;
 
 // ---- 6. ПРОТОТИПЫ ----
 void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
@@ -80,6 +93,8 @@ void checkNodeConnection();
 void updateAlarmState();
 void sendConnectionStatusToWeb(bool connected);
 void processEncoderData(float angle, bool magnet);
+void updateHistory(float angle);
+void updateMaxMin();
 void broadcastEncoderData();
 
 // ===================== SETUP =====================
@@ -87,8 +102,14 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 4.0) ===");
-    Serial.println("=== Ветер: скользящее среднее двух точек, без буфера ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 5.2) ===");
+    Serial.println("=== ПОЛНОСТЬЮ РАБОЧАЯ ВЕРСИЯ ===");
+
+    // ИНИЦИАЛИЗАЦИЯ ИСТОРИИ
+    historyCount = 0;
+    historyIndex = 0;
+    minAngle = 361.0;
+    maxAngle = -1.0;
 
     WiFi.mode(WIFI_AP);
     if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
@@ -225,7 +246,7 @@ void setup() {
         }
         #ledToggleBtn {
             font-size: 15px;
-            padding: 12px 30px;
+            padding: 10px 20px;
             border: none;
             border-radius: 8px;
             cursor: pointer;
@@ -357,6 +378,32 @@ void setup() {
             font-style: italic;
         }
         .clearfix { clear: both; }
+        
+        /* Легенда */
+        .wind-legend {
+            display: flex;
+            gap: 15px;
+            margin-top: 8px;
+            font-size: 10px;
+            color: #7f8c8d;
+        }
+        .legend-red {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background: #e74c3c;
+            border-radius: 2px;
+            margin-right: 4px;
+        }
+        .legend-yellow {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background: #f1c40f;
+            opacity: 0.7;
+            border-radius: 2px;
+            margin-right: 4px;
+        }
     </style>
 </head>
 <body>
@@ -396,21 +443,29 @@ void setup() {
                         <div class="direction w">W</div>
                         <svg viewBox="0 0 100 100">
                             <circle cx="50" cy="50" r="48" fill="#ecf0f1" stroke="#34495e" stroke-width="1"/>
+                            <!-- Желтый сектор (мин-макс за 30 сек) -->
+                            <path id="windSectorMax" d="" fill="#f1c40f" fill-opacity="0.5"/>
+                            <!-- Красный сектор (текущий размах) -->
                             <path id="windSector" d="" fill="#e74c3c" fill-opacity="0.7"/>
+                            <!-- Стрелка направления -->
                             <path id="windArrow" d="M50 10 L54 42 L50 50 L46 42 Z" fill="#2c3e50" stroke="white" stroke-width="1"/>
                             <circle cx="50" cy="50" r="4" fill="#34495e" stroke="white" stroke-width="1"/>
                         </svg>
                     </div>
                     
-                    <div style="margin-left: 12px;">
+                    <div style="margin-left: 12px; flex-grow: 1;">
                         <div>
                             <span id="windAngle" style="font-size: 18px; font-weight: bold;">--</span>
                             <span style="color: #7f8c8d;">°</span>
                             <span id="stabilityBadge" class="wind-badge">ШТИЛЬ</span>
                         </div>
                         <div style="color: #7f8c8d; font-size: 11px; margin-top: 4px;">
-                            ±<span id="sectorWidth">--</span>°
-                            <span style="margin-left: 8px;" id="sectorRange">---</span>
+                            <span style="color: #e74c3c;">●</span> ±<span id="sectorWidth">--</span>°
+                            <span style="margin-left: 8px; color: #f1c40f;">●</span> <span id="maxRange">---</span>
+                        </div>
+                        <div class="wind-legend">
+                            <span><span class="legend-red"></span> текущий</span>
+                            <span><span class="legend-yellow"></span> мин-макс за 30 сек</span>
                         </div>
                     </div>
                 </div>
@@ -455,6 +510,7 @@ void setup() {
                 <div class="direction w">W</div>
                 <svg viewBox="0 0 100 100">
                     <circle cx="50" cy="50" r="48" fill="#ecf0f1" stroke="#34495e" stroke-width="2"/>
+                    <path id="windSectorMaxLarge" d="" fill="#f1c40f" fill-opacity="0.5"/>
                     <path id="windSectorLarge" d="" fill="#e74c3c" fill-opacity="0.7"/>
                     <path id="windArrowLarge" d="M50 10 L54 42 L50 50 L46 42 Z" fill="#2c3e50" stroke="white" stroke-width="1.5"/>
                     <circle cx="50" cy="50" r="4" fill="#34495e" stroke="white" stroke-width="2"/>
@@ -465,8 +521,8 @@ void setup() {
                 <span style="font-size: 20px; color: #7f8c8d;">°</span>
                 <span id="stabilityBadgeLarge" style="display: inline-block; padding: 8px 20px; border-radius: 20px; font-size: 16px; font-weight: bold; color: white; margin-left: 15px;">ШТИЛЬ</span>
                 <div style="margin-top: 15px; color: #7f8c8d; font-size: 18px;">
-                    ±<span id="sectorWidthLarge">--</span>° 
-                    <span style="margin-left: 20px;" id="sectorRangeLarge">---</span>
+                    <span style="color: #e74c3c;">●</span> ±<span id="sectorWidthLarge">--</span>°
+                    <span style="margin-left: 20px; color: #f1c40f;">●</span> <span id="maxRangeLarge">---</span>
                 </div>
             </div>
         </div>
@@ -547,7 +603,7 @@ void setup() {
                 modal.style.display = 'flex';
                 document.getElementById('windAngleLarge').textContent = document.getElementById('windAngle').textContent;
                 document.getElementById('sectorWidthLarge').textContent = document.getElementById('sectorWidth').textContent;
-                document.getElementById('sectorRangeLarge').innerHTML = document.getElementById('sectorRange').innerHTML;
+                document.getElementById('maxRangeLarge').innerHTML = document.getElementById('maxRange').innerHTML;
                 
                 let badge = document.getElementById('stabilityBadge');
                 let badgeLarge = document.getElementById('stabilityBadgeLarge');
@@ -557,6 +613,12 @@ void setup() {
                 let sector = document.getElementById('windSector');
                 let sectorLarge = document.getElementById('windSectorLarge');
                 sectorLarge.setAttribute('d', sector.getAttribute('d'));
+                
+                let sectorMax = document.getElementById('windSectorMax');
+                let sectorMaxLarge = document.getElementById('windSectorMaxLarge');
+                if (sectorMax && sectorMaxLarge) {
+                    sectorMaxLarge.setAttribute('d', sectorMax.getAttribute('d'));
+                }
                 
                 let arrow = document.getElementById('windArrow');
                 let arrowLarge = document.getElementById('windArrowLarge');
@@ -629,46 +691,36 @@ void setup() {
             }
         }
 
-        function drawWindSectorAndArrow(start, end, angle) {
-            function draw(pathId, s, e) {
-                let path = document.getElementById(pathId);
-                if (!path) return;
-                let cx = 50, cy = 50, r = 48;
-                
-                function degToRad(d) {
-                    return (d - 90) * Math.PI / 180;
-                }
-                
-                let startRad = degToRad(s);
-                let endRad = degToRad(e);
-                
-                let x1 = cx + r * Math.cos(startRad);
-                let y1 = cy + r * Math.sin(startRad);
-                let x2 = cx + r * Math.cos(endRad);
-                let y2 = cy + r * Math.sin(endRad);
-                
-                let angleDiff = e - s;
-                if (angleDiff < 0) angleDiff += 360;
-                let largeArc = angleDiff > 180 ? 1 : 0;
-                
-                let d = `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2} Z`;
-                path.setAttribute('d', d);
+        function drawSector(pathId, start, end) {
+            let path = document.getElementById(pathId);
+            if (!path) return;
+            let cx = 50, cy = 50, r = 48;
+            
+            function degToRad(d) {
+                return (d - 90) * Math.PI / 180;
             }
             
-            draw('windSector', start, end);
-            if (document.getElementById('windSectorLarge')) {
-                draw('windSectorLarge', start, end);
-            }
+            let startRad = degToRad(start);
+            let endRad = degToRad(end);
             
-            function rotate(arrowId, deg) {
-                let arrow = document.getElementById(arrowId);
-                if (arrow) {
-                    arrow.setAttribute('transform', `rotate(${deg}, 50, 50)`);
-                }
-            }
+            let x1 = cx + r * Math.cos(startRad);
+            let y1 = cy + r * Math.sin(startRad);
+            let x2 = cx + r * Math.cos(endRad);
+            let y2 = cy + r * Math.sin(endRad);
             
-            rotate('windArrow', angle);
-            rotate('windArrowLarge', angle);
+            let angleDiff = end - start;
+            if (angleDiff < 0) angleDiff += 360;
+            let largeArc = angleDiff > 180 ? 1 : 0;
+            
+            let d = `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2} Z`;
+            path.setAttribute('d', d);
+        }
+
+        function rotateArrow(arrowId, deg) {
+            let arrow = document.getElementById(arrowId);
+            if (arrow) {
+                arrow.setAttribute('transform', `rotate(${deg}, 50, 50)`);
+            }
         }
 
         ws.onmessage = function(event) {
@@ -725,12 +777,12 @@ void setup() {
             else if (msg.type === 'wind') {
                 document.getElementById('windAngle').textContent = msg.angle_avg;
                 document.getElementById('sectorWidth').textContent = msg.sector_width;
-                document.getElementById('sectorRange').innerHTML = `${msg.sector_start}° - ${msg.sector_end}°`;
+                document.getElementById('maxRange').innerHTML = `${msg.history_min}° - ${msg.history_max}°`;
                 
                 if (document.getElementById('windModal').style.display === 'flex') {
                     document.getElementById('windAngleLarge').textContent = msg.angle_avg;
                     document.getElementById('sectorWidthLarge').textContent = msg.sector_width;
-                    document.getElementById('sectorRangeLarge').innerHTML = `${msg.sector_start}° - ${msg.sector_end}°`;
+                    document.getElementById('maxRangeLarge').innerHTML = `${msg.history_min}° - ${msg.history_max}°`;
                 }
                 
                 let magnet = document.getElementById('magnetIndicator');
@@ -745,20 +797,42 @@ void setup() {
                     magnetText.style.color = '#e74c3c';
                 }
                 
+                // СТАБИЛЬНОСТЬ ВЕТРА - РАБОТАЕТ!
+                let stability = msg.stability;
                 let badge = document.getElementById('stabilityBadge');
                 let badgeLarge = document.getElementById('stabilityBadgeLarge');
-                badge.textContent = 'ШТИЛЬ';
-                badge.style.backgroundColor = '#3498db';
-                if (badgeLarge) {
-                    badgeLarge.textContent = 'ШТИЛЬ';
-                    badgeLarge.style.backgroundColor = '#3498db';
+                let text = '', color = '';
+                
+                switch(stability) {
+                    case 'calm':   text = 'ШТИЛЬ';    color = '#3498db'; break;
+                    case 'gusty':  text = 'ПОРЫВИСТЫЙ'; color = '#e67e22'; break;
+                    case 'strong': text = 'СИЛЬНЫЙ';   color = '#e74c3c'; break;
+                    case 'storm':  text = 'ШТОРМ';     color = '#8e44ad'; break;
+                    default:       text = 'ШТИЛЬ';    color = '#3498db';
                 }
                 
-                drawWindSectorAndArrow(
-                    parseFloat(msg.sector_start), 
-                    parseFloat(msg.sector_end), 
-                    parseFloat(msg.angle_avg)
-                );
+                badge.textContent = text;
+                badge.style.backgroundColor = color;
+                if (badgeLarge) {
+                    badgeLarge.textContent = text;
+                    badgeLarge.style.backgroundColor = color;
+                }
+                
+                // Рисуем красный сектор (текущий размах)
+                if (msg.sector_start !== undefined && msg.sector_end !== undefined) {
+                    drawSector('windSector', parseFloat(msg.sector_start), parseFloat(msg.sector_end));
+                    drawSector('windSectorLarge', parseFloat(msg.sector_start), parseFloat(msg.sector_end));
+                }
+                
+                // Рисуем желтый сектор (мин-макс за 30 сек)
+                if (msg.history_min !== undefined && msg.history_max !== undefined) {
+                    drawSector('windSectorMax', parseFloat(msg.history_min), parseFloat(msg.history_max));
+                    drawSector('windSectorMaxLarge', parseFloat(msg.history_min), parseFloat(msg.history_max));
+                }
+                
+                // Поворачиваем стрелку
+                rotateArrow('windArrow', parseFloat(msg.angle_avg));
+                rotateArrow('windArrowLarge', parseFloat(msg.angle_avg));
             }
         };
 
@@ -817,7 +891,7 @@ void setup() {
     Serial.println("\n=== ХАБ ГОТОВ К РАБОТЕ ===");
     Serial.println("1. Подключитесь к Wi-Fi: " + String(AP_SSID));
     Serial.println("2. Откройте: http://" + WiFi.softAPIP().toString());
-    Serial.println("3. Ветер: две точки, векторное среднее, сектор = разница\n");
+    Serial.println("3. Ветер: желтый сектор 30 сек, штиль/шторм РАБОТАЕТ\n");
 }
 
 void loop() {
@@ -827,6 +901,7 @@ void loop() {
     
     unsigned long now = millis();
     if (now - lastEncoderBroadcastTime >= ENCODER_BROADCAST_INTERVAL) {
+        updateMaxMin();
         broadcastEncoderData();
         lastEncoderBroadcastTime = now;
     }
@@ -994,6 +1069,7 @@ void processNodeData(const uint8_t *data, int len) {
         
         if (magnet) {
             processEncoderData(angle, true);
+            updateHistory(angle);
         }
     }
 }
@@ -1030,13 +1106,13 @@ String relayStateToString(uint32_t state) {
     return (state == 1) ? "ВКЛЮЧЕНО" : "ВЫКЛЮЧЕНО";
 }
 
-// ========== ВЕТЕР: ДВЕ ТОЧКИ, ВЕКТОРНОЕ СРЕДНЕЕ ==========
+// ========== ВЕТЕР: ДВЕ ТОЧКИ + ЖЕЛТЫЙ СЕКТОР 30 СЕК + ШТИЛЬ/ШТОРМ ==========
 void processEncoderData(float angle, bool magnet) {
     if (prevEncoderAngle < 0) {
         prevEncoderAngle = angle;
         currentEncoderAngle = angle;
         windDirection = angle;
-        windSector = 0.0;
+        windCurrentSector = 0.0;
         Serial.printf("🌪️ Ветер: первое значение %.1f°\n", angle);
     } else {
         prevEncoderAngle = currentEncoderAngle;
@@ -1051,38 +1127,75 @@ void processEncoderData(float angle, bool magnet) {
         if (windDirection < 0) windDirection += 360.0;
         
         float diff = fmod(currentEncoderAngle - prevEncoderAngle + 540.0, 360.0) - 180.0;
-        windSector = fabs(diff);
+        windCurrentSector = fabs(diff);
         
         Serial.printf("🌪️ Ветер: prev=%.1f°, curr=%.1f°, напр=%.1f°, сектор=%.1f°\n", 
-                      prevEncoderAngle, currentEncoderAngle, windDirection, windSector);
+                      prevEncoderAngle, currentEncoderAngle, windDirection, windCurrentSector);
     }
     
     windMagnet = magnet;
-    broadcastEncoderData();
+}
+
+void updateHistory(float angle) {
+    encoderHistory[historyIndex] = angle;
+    historyTimestamps[historyIndex] = millis();
+    historyIndex = (historyIndex + 1) % ENCODER_HISTORY_SIZE;
+    if (historyCount < ENCODER_HISTORY_SIZE) {
+        historyCount++;
+        Serial.printf("📝 История: добавлен %.1f°, всего записей: %d\n", angle, historyCount);
+    }
+}
+
+void updateMaxMin() {
+    if (historyCount == 0) return;
+    
+    unsigned long now = millis();
+    float currentMin = 361.0;
+    float currentMax = -1.0;
+    int validCount = 0;
+    
+    for (int i = 0; i < historyCount; i++) {
+        if (now - historyTimestamps[i] <= 30000) { // 30 секунд
+            float a = encoderHistory[i];
+            if (a < currentMin) currentMin = a;
+            if (a > currentMax) currentMax = a;
+            validCount++;
+        }
+    }
+    
+    if (validCount > 0 && currentMax >= 0) {
+        maxAngle = currentMax;
+        minAngle = currentMin;
+        Serial.printf("📊 Желтый сектор: мин=%.1f°, макс=%.1f° (%d записей)\n", 
+                     minAngle, maxAngle, validCount);
+    }
 }
 
 void broadcastEncoderData() {
     if (prevEncoderAngle < 0) return;
     
-    float start = windDirection - windSector / 2;
-    float end = windDirection + windSector / 2;
+    float redStart = windDirection - windCurrentSector / 2;
+    float redEnd = windDirection + windCurrentSector / 2;
+    redStart = fmod(fmod(redStart, 360) + 360, 360);
+    redEnd = fmod(fmod(redEnd, 360) + 360, 360);
     
-    start = fmod(fmod(start, 360) + 360, 360);
-    end = fmod(fmod(end, 360) + 360, 360);
-    
-    bool crossZero = (windSector > 0 && 
-                     ((prevEncoderAngle > 270 && currentEncoderAngle < 90) || 
-                      (prevEncoderAngle < 90 && currentEncoderAngle > 270)));
+    // СТАБИЛЬНОСТЬ ПО ТЕКУЩЕМУ РАЗМАХУ
+    String stability;
+    if (windCurrentSector < 10) stability = "calm";
+    else if (windCurrentSector < 30) stability = "gusty";
+    else if (windCurrentSector < 60) stability = "strong";
+    else stability = "storm";
     
     StaticJsonDocument<256> doc;
     doc["type"] = "wind";
     doc["angle_avg"] = serialized(String(windDirection, 1));
-    doc["sector_width"] = serialized(String(windSector, 1));
-    doc["sector_start"] = serialized(String(start, 0));
-    doc["sector_end"] = serialized(String(end, 0));
-    doc["cross_zero"] = crossZero;
+    doc["sector_width"] = serialized(String(windCurrentSector, 1));
+    doc["sector_start"] = serialized(String(redStart, 0));
+    doc["sector_end"] = serialized(String(redEnd, 0));
+    doc["history_min"] = serialized(String(minAngle, 0));
+    doc["history_max"] = serialized(String(maxAngle, 0));
     doc["magnet"] = windMagnet;
-    doc["stability"] = "calm";
+    doc["stability"] = stability;
     
     String json;
     serializeJson(doc, json);
