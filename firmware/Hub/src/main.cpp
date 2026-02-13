@@ -1,6 +1,6 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
- * ВЕРСИЯ 5.4: ПОЛНОСТЬЮ РАБОЧАЯ - ветер, желтый сектор 30 сек, штиль/шторм
+ * ВЕРСИЯ 5.5: ГЛОБАЛЬНАЯ ТРЕВОГА (логическое ИЛИ для всех узлов)
  * Добавлена поддержка 4 узлов (ID 102, 103, 104, 105)
  * Добавлена кнопка "О системе" с версиями прошивок
  */
@@ -16,7 +16,7 @@ const char* AP_SSID = "SmartHome-Hub";
 const char* AP_PASSWORD = "12345678";
 
 // Версии прошивок
-const char* HUB_VERSION = "5.4";
+const char* HUB_VERSION = "5.5";
 const char* NODE_VERSION = "2.1";  // Все узлы используют одну версию
 
 // MAC адреса узлов
@@ -53,6 +53,9 @@ bool nodeConnectionLost[NODE_COUNT] = {false, false, false, false};
 unsigned long connectionLostTime[NODE_COUNT] = {0, 0, 0, 0};
 const unsigned long CONNECTION_LOST_COOLDOWN = 10000;
 
+// Статусы тревоги для каждого узла (ДОБАВЛЕНО для глобальной тревоги)
+bool nodeAlarmState[NODE_COUNT] = {false, false, false, false};
+
 // ---- 2. УНИВЕРСАЛЬНАЯ СТРУКТУРА ESP-NOW ----
 typedef struct esp_now_message {
     char json[192];
@@ -86,6 +89,9 @@ const unsigned long GREENHOUSE_UPDATE_INTERVAL = 30000;
 bool securityAlarmActive = false;
 unsigned long alarmStartTime = 0;
 const unsigned long ALARM_DURATION_MS = 10000;
+
+// Глобальная тревога (ДОБАВЛЕНО)
+bool globalAlarmActive = false;
 
 // ---- 5. ДАННЫЕ ЭНКОДЕРА AS5600 - ДВЕ ТОЧКИ + ИСТОРИЯ 30 СЕК ----
 #define ENCODER_HISTORY_SIZE 6        // 6 значений = 30 секунд при 5 сек
@@ -125,14 +131,15 @@ void processEncoderData(float angle, bool magnet);
 void updateHistory(float angle);
 void updateMaxMin();
 void broadcastEncoderData();
+void checkGlobalAlarm();  // ДОБАВЛЕНО
 
 // ===================== SETUP =====================
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 5.4) ===");
-    Serial.println("=== ПОДДЕРЖКА 4 УЗЛОВ (102, 103, 104, 105) ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 5.5) ===");
+    Serial.println("=== ГЛОБАЛЬНАЯ ТРЕВОГА ДЛЯ ВСЕХ УЗЛОВ ===");
 
     // ИНИЦИАЛИЗАЦИЯ ИСТОРИИ
     historyCount = 0;
@@ -213,6 +220,23 @@ void setup() {
             background: #2c3e50;
             transform: translateY(-2px);
             box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        .global-alarm-banner {
+            background: #ff4444;
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            text-align: center;
+            font-size: 24px;
+            font-weight: bold;
+            animation: alarm-pulse 1s infinite;
+            display: none;
+        }
+        @keyframes alarm-pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
         }
         .section {
             background: #f9f9f9;
@@ -333,11 +357,6 @@ void setup() {
             background: linear-gradient(135deg, #e74c3c, #c0392b);
             color: white;
             animation: alarm-pulse 1s infinite;
-        }
-        @keyframes alarm-pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.7; }
-            100% { opacity: 1; }
         }
         
         /* Компас */
@@ -544,6 +563,11 @@ void setup() {
         <button id="refreshBtn" onclick="refreshAllData()">🔄 ОБНОВИТЬ ВСЕ ДАННЫЕ</button>
         <button id="aboutBtn" onclick="showAboutModal()">ℹ️ О СИСТЕМЕ</button>
         
+        <!-- Глобальная тревога (ДОБАВЛЕНО) -->
+        <div id="globalAlarmBanner" class="global-alarm-banner">
+            🚨 ГЛОБАЛЬНАЯ ТРЕВОГА 🚨
+        </div>
+        
         <div class="section">
             <div class="section-title">🔧 Узел #102 (Мастерская, с энкодером)</div>
             <div class="section-info">MAC: AC:EB:E6:49:10:28</div>
@@ -718,7 +742,7 @@ void setup() {
             <div class="about-version">
                 <div class="about-version-item">
                     <span class="about-device">Хаб (ESP32)</span>
-                    <span class="about-ver" id="hubVersion">5.4</span>
+                    <span class="about-ver" id="hubVersion">5.5</span>
                 </div>
                 <div class="about-version-item">
                     <span class="about-device">Узел #102 (с энкодером)</span>
@@ -752,8 +776,9 @@ void setup() {
                     <li>Управление LED (GPIO8) с веб-интерфейса</li>
                     <li>Ветер: отображение направления, размаха, желтый сектор 30 сек, штиль/шторм</li>
                     <li>Автоопределение потери связи (70 сек)</li>
+                    <li>Глобальная тревога при срабатывании любого узла</li>
                 </ul>
-                <strong>Версия хаба:</strong> 5.4<br>
+                <strong>Версия хаба:</strong> 5.5<br>
                 <strong>Версия узлов:</strong> 2.1<br>
                 <strong>Дата сборки:</strong> 2024
             </div>
@@ -925,11 +950,29 @@ void setup() {
                 else if (c1) txt += 'Концевик 1 разорван';
                 else if (c2) txt += 'Концевик 2 разорван';
                 el.innerHTML = txt;
-                if (nodeId === 102) playAlarmTone(); // Звук только для узла #102
             } else {
                 el.className = 'security-status security-normal';
                 el.innerHTML = '🔒 ОХРАНА: НОРМА';
-                if (nodeId === 102) stopAlarm();
+            }
+        }
+
+        // ДОБАВЛЕНО: функция для отображения глобальной тревоги
+        function showGlobalAlarm(active) {
+            let banner = document.getElementById('globalAlarmBanner');
+            if (active) {
+                banner.style.display = 'block';
+                playAlarmTone(); // Звук для глобальной тревоги
+            } else {
+                banner.style.display = 'none';
+                // Останавливаем звук только если нет других тревог
+                let anyAlarm = false;
+                for (let id of [102, 103, 104, 105]) {
+                    if (document.getElementById('securityStatus' + id).className.includes('security-alarm')) {
+                        anyAlarm = true;
+                        break;
+                    }
+                }
+                if (!anyAlarm) stopAlarm();
             }
         }
 
@@ -989,6 +1032,9 @@ void setup() {
             }
             else if (msg.type === 'security') {
                 updateSecurityStatus(msg.node, msg.alarm, msg.contact1, msg.contact2);
+            }
+            else if (msg.type === 'global_alarm') {  // ДОБАВЛЕНО
+                showGlobalAlarm(msg.state);
             }
             else if (msg.type === 'connection_lost') {
                 markNodeDataAsStale(msg.node);
@@ -1150,7 +1196,7 @@ void setup() {
     Serial.println("2. Откройте: http://" + WiFi.softAPIP().toString());
     Serial.println("3. Ветер: желтый сектор 30 сек, штиль/шторм РАБОТАЕТ");
     Serial.println("4. Поддерживается 4 узла (ID 102, 103, 104, 105)");
-    Serial.println("5. Версия хаба: 5.4, версия узлов: 2.1\n");
+    Serial.println("5. Версия хаба: 5.5 (глобальная тревога), версия узлов: 2.1\n");
 }
 
 void loop() {
@@ -1202,12 +1248,50 @@ void checkNodeConnection() {
 void updateAlarmState() {
     if (securityAlarmActive && (millis() - alarmStartTime) > ALARM_DURATION_MS) {
         securityAlarmActive = false;
+        checkGlobalAlarm(); // ДОБАВЛЕНО
+    }
+}
+
+// ДОБАВЛЕНО: функция проверки глобальной тревоги
+void checkGlobalAlarm() {
+    bool newGlobalAlarm = false;
+    for (int i = 0; i < NODE_COUNT; i++) {
+        if (nodeAlarmState[i]) {
+            newGlobalAlarm = true;
+            break;
+        }
+    }
+    
+    if (newGlobalAlarm != globalAlarmActive) {
+        globalAlarmActive = newGlobalAlarm;
+        if (globalAlarmActive) {
+            Serial.println("🚨 ГЛОБАЛЬНАЯ ТРЕВОГА!");
+        } else {
+            Serial.println("✅ Глобальная тревога снята");
+        }
+        
+        // Отправляем статус в WebSocket
+        StaticJsonDocument<100> doc;
+        doc["type"] = "global_alarm";
+        doc["state"] = globalAlarmActive;
+        String json;
+        serializeJson(doc, json);
+        ws.textAll(json);
     }
 }
 
 void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                      AwsEventType type, void *arg, uint8_t *data, size_t len) {
-    if (type == WS_EVT_DATA) {
+    if (type == WS_EVT_CONNECT) {
+        // Отправляем текущий статус глобальной тревоги новому клиенту
+        StaticJsonDocument<100> doc;
+        doc["type"] = "global_alarm";
+        doc["state"] = globalAlarmActive;
+        String json;
+        serializeJson(doc, json);
+        client->text(json);
+    }
+    else if (type == WS_EVT_DATA) {
         StaticJsonDocument<200> doc;
         if (!deserializeJson(doc, data, len) && doc.containsKey("command")) {
             String cmd = doc["command"].as<String>();
@@ -1300,13 +1384,20 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         bool c1 = doc["contact1"];
         bool c2 = doc["contact2"];
         
-        if (alarm && !securityAlarmActive && nodeId == 102) { // Только для узла #102
+        // Сохраняем статус для глобальной тревоги (ДОБАВЛЕНО)
+        nodeAlarmState[nodeIndex] = alarm;
+        
+        // Локальная тревога для узла #102 (оставляем как есть)
+        if (alarm && !securityAlarmActive && nodeId == 102) {
             securityAlarmActive = true;
             alarmStartTime = millis();
-            Serial.println("🚨 ТРЕВОГА!");
+            Serial.println("🚨 ТРЕВОГА (узел #102)!");
         } else if (!alarm && nodeId == 102) {
             securityAlarmActive = false;
         }
+        
+        // Проверяем глобальную тревогу (ДОБАВЛЕНО)
+        checkGlobalAlarm();
         
         StaticJsonDocument<200> resp;
         resp["type"] = "security";
