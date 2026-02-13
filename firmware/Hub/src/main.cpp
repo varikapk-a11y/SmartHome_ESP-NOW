@@ -1,7 +1,8 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
- * ВЕРСИЯ 5.3: ПОЛНОСТЬЮ РАБОЧАЯ - ветер, желтый сектор 30 сек, штиль/шторм
- * Добавлена поддержка 4 узлов (ID 101, 103, 104, 105)
+ * ВЕРСИЯ 5.4: ПОЛНОСТЬЮ РАБОЧАЯ - ветер, желтый сектор 30 сек, штиль/шторм
+ * Добавлена поддержка 4 узлов (ID 102, 103, 104, 105)
+ * Добавлена кнопка "О системе" с версиями прошивок
  */
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -14,15 +15,19 @@
 const char* AP_SSID = "SmartHome-Hub";
 const char* AP_PASSWORD = "12345678";
 
+// Версии прошивок
+const char* HUB_VERSION = "5.4";
+const char* NODE_VERSION = "2.1";  // Все узлы используют одну версию
+
 // MAC адреса узлов
-// Узел #1 (ID 101) - основной, с энкодером
-uint8_t node1MacAddress[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
-// Узел #3 (ID 103)
-uint8_t node3MacAddress[] = {0x88, 0x56, 0xA6, 0x7D, 0x09, 0x64};
-// Узел #4 (ID 104)
-uint8_t node4MacAddress[] = {0x10, 0x00, 0x3B, 0xB1, 0xA6, 0x9C};
-// Узел #5 (ID 105)
-uint8_t node5MacAddress[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28}; // Совпадает с #1? Уточни, если нужно изменить
+// Узел #102 - основной, с энкодером
+uint8_t node102MacAddress[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
+// Узел #103
+uint8_t node103MacAddress[] = {0x88, 0x56, 0xA6, 0x7D, 0x09, 0x64};
+// Узел #104
+uint8_t node104MacAddress[] = {0x10, 0x00, 0x3B, 0xB1, 0xA6, 0x9C};
+// Узел #105
+uint8_t node105MacAddress[] = {0x88, 0x56, 0xA6, 0x7C, 0xF2, 0xA8};
 
 // MAC устройства "Теплица"
 uint8_t greenhouseMac[] = {0xE8, 0x9F, 0x6D, 0x87, 0x34, 0x8A};
@@ -30,11 +35,14 @@ uint8_t greenhouseMac[] = {0xE8, 0x9F, 0x6D, 0x87, 0x34, 0x8A};
 // Массив всех узлов для удобства
 #define NODE_COUNT 4
 uint8_t* nodeMacs[NODE_COUNT] = {
-    node1MacAddress,
-    node3MacAddress,
-    node4MacAddress,
-    node5MacAddress
+    node102MacAddress,
+    node103MacAddress,
+    node104MacAddress,
+    node105MacAddress
 };
+
+// Номера узлов для отображения
+int nodeNumbers[NODE_COUNT] = {102, 103, 104, 105};
 
 // Время последнего получения данных от каждого узла
 unsigned long lastNodeDataTime[NODE_COUNT] = {0, 0, 0, 0};
@@ -123,8 +131,8 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 5.3) ===");
-    Serial.println("=== ПОДДЕРЖКА 4 УЗЛОВ ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 5.4) ===");
+    Serial.println("=== ПОДДЕРЖКА 4 УЗЛОВ (102, 103, 104, 105) ===");
 
     // ИНИЦИАЛИЗАЦИЯ ИСТОРИИ
     historyCount = 0;
@@ -184,6 +192,25 @@ void setup() {
         }
         #refreshBtn:hover {
             background: #2980b9;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        #aboutBtn {
+            font-size: 14px;
+            padding: 10px 25px;
+            background: #34495e;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            margin: 10px auto 30px;
+            display: block;
+            width: 250px;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+        #aboutBtn:hover {
+            background: #2c3e50;
             transform: translateY(-2px);
             box-shadow: 0 4px 8px rgba(0,0,0,0.1);
         }
@@ -265,7 +292,7 @@ void setup() {
             background-color: #e74c3c;
             color: white;
         }
-        #ledToggleBtn {
+        .led-toggle-btn {
             font-size: 15px;
             padding: 10px 20px;
             border: none;
@@ -279,13 +306,13 @@ void setup() {
             float: left;
             min-height: 50px;
         }
-        #ledToggleBtn.led-on {
+        .led-toggle-btn.led-on {
             background: linear-gradient(135deg, #e74c3c, #c0392b);
         }
-        #ledToggleBtn.led-off {
+        .led-toggle-btn.led-off {
             background: linear-gradient(135deg, #2ecc71, #27ae60);
         }
-        #ledToggleBtn.led-unknown {
+        .led-toggle-btn.led-unknown {
             background: #95a5a6;
             cursor: not-allowed;
         }
@@ -425,30 +452,114 @@ void setup() {
             border-radius: 2px;
             margin-right: 4px;
         }
+        
+        /* Модальное окно "О системе" */
+        .about-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 9999;
+            justify-content: center;
+            align-items: center;
+        }
+        .about-modal-content {
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            max-width: 500px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+            position: relative;
+        }
+        .about-close {
+            position: absolute;
+            top: 15px;
+            right: 20px;
+            font-size: 28px;
+            font-weight: bold;
+            color: #7f8c8d;
+            cursor: pointer;
+            transition: color 0.3s;
+        }
+        .about-close:hover {
+            color: #e74c3c;
+        }
+        .about-title {
+            font-size: 24px;
+            color: #2c3e50;
+            margin-bottom: 20px;
+            text-align: center;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+        }
+        .about-version {
+            background: #ecf0f1;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+        }
+        .about-version-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #bdc3c7;
+        }
+        .about-version-item:last-child {
+            border-bottom: none;
+        }
+        .about-device {
+            font-weight: bold;
+            color: #3498db;
+        }
+        .about-ver {
+            font-family: 'Courier New', monospace;
+            background: #2c3e50;
+            color: white;
+            padding: 3px 10px;
+            border-radius: 15px;
+        }
+        .about-description {
+            margin-top: 20px;
+            color: #7f8c8d;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        .about-description ul {
+            padding-left: 20px;
+        }
+        .about-description li {
+            margin: 5px 0;
+        }
     </style>
 </head>
 <body>
     <div class="dashboard">
         <h1>🏠 Умный дом ESP-NOW</h1>
         
-        <button id="refreshBtn" onclick="refreshNodeData()">🔄 ОБНОВИТЬ ДАННЫЕ</button>
+        <button id="refreshBtn" onclick="refreshAllData()">🔄 ОБНОВИТЬ ВСЕ ДАННЫЕ</button>
+        <button id="aboutBtn" onclick="showAboutModal()">ℹ️ О СИСТЕМЕ</button>
         
         <div class="section">
-            <div class="section-title">🔧 Узел #1 (Мастерская)</div>
+            <div class="section-title">🔧 Узел #102 (Мастерская, с энкодером)</div>
             <div class="section-info">MAC: AC:EB:E6:49:10:28</div>
             
-            <div id="securityStatus1" class="security-status security-normal">
+            <div id="securityStatus102" class="security-status security-normal">
                 🔒 ОХРАНА: НОРМА (концевики замкнуты)
             </div>
             
-            <button id="ledToggleBtn1" class="led-unknown" onclick="toggleLED(1)">--</button>
+            <button id="ledToggleBtn102" class="led-toggle-btn led-unknown" onclick="toggleLED(102)">--</button>
             <div class="clearfix"></div>
             
-            <div id="nodeSensorData1">
-                <p>Нажмите "Обновить данные" для получения показаний</p>
+            <div id="nodeSensorData102">
+                <p>Нажмите "Обновить все данные" для получения показаний</p>
             </div>
             
-            <!-- БЛОК ВЕТРА (только для узла #1) -->
+            <!-- БЛОК ВЕТРА (только для узла #102) -->
             <div id="windBlock" class="wind-compact" onclick="toggleWindSize()" style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed #ccc;">
                 <div style="display: flex; align-items: center; margin-bottom: 8px;">
                     <span style="font-weight: bold; color: #2c3e50; font-size: 1.1em;">🌪️ Ветер</span>
@@ -494,49 +605,49 @@ void setup() {
         </div>
 
         <div class="section">
-            <div class="section-title">🔧 Узел #3</div>
+            <div class="section-title">🔧 Узел #103</div>
             <div class="section-info">MAC: 88:56:A6:7D:09:64</div>
             
-            <div id="securityStatus3" class="security-status security-normal">
+            <div id="securityStatus103" class="security-status security-normal">
                 🔒 ОХРАНА: НОРМА
             </div>
             
-            <button id="ledToggleBtn3" class="led-unknown" onclick="toggleLED(3)">--</button>
+            <button id="ledToggleBtn103" class="led-toggle-btn led-unknown" onclick="toggleLED(103)">--</button>
             <div class="clearfix"></div>
             
-            <div id="nodeSensorData3">
+            <div id="nodeSensorData103">
                 <p>Ожидание данных...</p>
             </div>
         </div>
 
         <div class="section">
-            <div class="section-title">🔧 Узел #4</div>
+            <div class="section-title">🔧 Узел #104</div>
             <div class="section-info">MAC: 10:00:3B:B1:A6:9C</div>
             
-            <div id="securityStatus4" class="security-status security-normal">
+            <div id="securityStatus104" class="security-status security-normal">
                 🔒 ОХРАНА: НОРМА
             </div>
             
-            <button id="ledToggleBtn4" class="led-unknown" onclick="toggleLED(4)">--</button>
+            <button id="ledToggleBtn104" class="led-toggle-btn led-unknown" onclick="toggleLED(104)">--</button>
             <div class="clearfix"></div>
             
-            <div id="nodeSensorData4">
+            <div id="nodeSensorData104">
                 <p>Ожидание данных...</p>
             </div>
         </div>
 
         <div class="section">
-            <div class="section-title">🔧 Узел #5</div>
-            <div class="section-info">MAC: AC:EB:E6:49:10:28</div>
+            <div class="section-title">🔧 Узел #105</div>
+            <div class="section-info">MAC: 88:56:A6:7C:F2:A8</div>
             
-            <div id="securityStatus5" class="security-status security-normal">
+            <div id="securityStatus105" class="security-status security-normal">
                 🔒 ОХРАНА: НОРМА
             </div>
             
-            <button id="ledToggleBtn5" class="led-unknown" onclick="toggleLED(5)">--</button>
+            <button id="ledToggleBtn105" class="led-toggle-btn led-unknown" onclick="toggleLED(105)">--</button>
             <div class="clearfix"></div>
             
-            <div id="nodeSensorData5">
+            <div id="nodeSensorData105">
                 <p>Ожидание данных...</p>
             </div>
         </div>
@@ -570,6 +681,7 @@ void setup() {
         </div>
     </div>
 
+    <!-- Модальное окно компаса -->
     <div id="windModal" class="wind-modal" onclick="toggleWindSize()">
         <div class="wind-modal-content" onclick="event.stopPropagation()">
             <div style="position: relative; width: 100%; height: 100%;">
@@ -597,10 +709,61 @@ void setup() {
         </div>
     </div>
 
+    <!-- Модальное окно "О системе" -->
+    <div id="aboutModal" class="about-modal" onclick="hideAboutModal()">
+        <div class="about-modal-content" onclick="event.stopPropagation()">
+            <span class="about-close" onclick="hideAboutModal()">&times;</span>
+            <div class="about-title">ℹ️ О системе</div>
+            
+            <div class="about-version">
+                <div class="about-version-item">
+                    <span class="about-device">Хаб (ESP32)</span>
+                    <span class="about-ver" id="hubVersion">5.4</span>
+                </div>
+                <div class="about-version-item">
+                    <span class="about-device">Узел #102 (с энкодером)</span>
+                    <span class="about-ver" id="node102Version">2.1</span>
+                </div>
+                <div class="about-version-item">
+                    <span class="about-device">Узел #103</span>
+                    <span class="about-ver" id="node103Version">2.1</span>
+                </div>
+                <div class="about-version-item">
+                    <span class="about-device">Узел #104</span>
+                    <span class="about-ver" id="node104Version">2.1</span>
+                </div>
+                <div class="about-version-item">
+                    <span class="about-device">Узел #105</span>
+                    <span class="about-ver" id="node105Version">2.1</span>
+                </div>
+                <div class="about-version-item">
+                    <span class="about-device">Теплица</span>
+                    <span class="about-ver">1.0</span>
+                </div>
+            </div>
+            
+            <div class="about-description">
+                <strong>Описание:</strong>
+                <ul>
+                    <li>ESP-NOW хаб для умного дома</li>
+                    <li>Поддержка 4 узлов (ESP32-C3) + теплица</li>
+                    <li>Датчики: AHT20, BMP280, AS5600 (энкодер)</li>
+                    <li>Охрана с концевиками (GPIO3, GPIO4)</li>
+                    <li>Управление LED (GPIO8) с веб-интерфейса</li>
+                    <li>Ветер: отображение направления, размаха, желтый сектор 30 сек, штиль/шторм</li>
+                    <li>Автоопределение потери связи (70 сек)</li>
+                </ul>
+                <strong>Версия хаба:</strong> 5.4<br>
+                <strong>Версия узлов:</strong> 2.1<br>
+                <strong>Дата сборки:</strong> 2024
+            </div>
+        </div>
+    </div>
+
     <script>
         const ws = new WebSocket('ws://' + window.location.hostname + '/ws');
-        let ledState = {1: 'unknown', 3: 'unknown', 4: 'unknown', 5: 'unknown'};
-        let buttonLocked = {1: false, 3: false, 4: false, 5: false};
+        let ledState = {102: 'unknown', 103: 'unknown', 104: 'unknown', 105: 'unknown'};
+        let buttonLocked = {102: false, 103: false, 104: false, 105: false};
         let audioContext = null;
         let alarmInterval = null;
         let isAlarmPlaying = false;
@@ -664,6 +827,14 @@ void setup() {
             setTimeout(() => beep(400, 0.3), 300);
         }
 
+        function showAboutModal() {
+            document.getElementById('aboutModal').style.display = 'flex';
+        }
+
+        function hideAboutModal() {
+            document.getElementById('aboutModal').style.display = 'none';
+        }
+
         function toggleWindSize() {
             let modal = document.getElementById('windModal');
             if (modal.style.display === 'flex') {
@@ -699,15 +870,15 @@ void setup() {
             let btn = document.getElementById('ledToggleBtn' + nodeId);
             if (ledState[nodeId] === 'on') {
                 btn.textContent = '⏸ ВЫКЛЮЧИТЬ LED';
-                btn.className = 'led-on';
+                btn.className = 'led-toggle-btn led-on';
                 btn.disabled = false;
             } else if (ledState[nodeId] === 'off') {
                 btn.textContent = '▶ ВКЛЮЧИТЬ LED';
-                btn.className = 'led-off';
+                btn.className = 'led-toggle-btn led-off';
                 btn.disabled = false;
             } else {
                 btn.textContent = '-- (статус неизвестен)';
-                btn.className = 'led-unknown';
+                btn.className = 'led-toggle-btn led-unknown';
                 btn.disabled = true;
             }
         }
@@ -722,8 +893,8 @@ void setup() {
             ws.send(JSON.stringify({command: cmd, node: nodeId}));
         }
 
-        function refreshNodeData() {
-            for (let id of [1, 3, 4, 5]) {
+        function refreshAllData() {
+            for (let id of [102, 103, 104, 105]) {
                 document.getElementById('nodeSensorData' + id).innerHTML = 
                     '<p style="color:#e74c3c;">⏳ Запрос данных отправлен...</p>';
             }
@@ -754,11 +925,11 @@ void setup() {
                 else if (c1) txt += 'Концевик 1 разорван';
                 else if (c2) txt += 'Концевик 2 разорван';
                 el.innerHTML = txt;
-                if (nodeId === 1) playAlarmTone(); // Звук только для узла #1
+                if (nodeId === 102) playAlarmTone(); // Звук только для узла #102
             } else {
                 el.className = 'security-status security-normal';
                 el.innerHTML = '🔒 ОХРАНА: НОРМА';
-                if (nodeId === 1) stopAlarm();
+                if (nodeId === 102) stopAlarm();
             }
         }
 
@@ -905,22 +1076,30 @@ void setup() {
         };
 
         ws.onopen = function() {
-            for (let id of [1, 3, 4, 5]) {
+            for (let id of [102, 103, 104, 105]) {
                 updateLEDButton(id);
             }
             ws.send(JSON.stringify({command: 'GET_STATUS'}));
         };
 
         ws.onclose = function() {
-            for (let id of [1, 3, 4, 5]) {
+            for (let id of [102, 103, 104, 105]) {
                 ledState[id] = 'unknown';
                 updateLEDButton(id);
             }
         };
 
-        for (let id of [1, 3, 4, 5]) {
+        for (let id of [102, 103, 104, 105]) {
             updateLEDButton(id);
         }
+
+        // Закрытие модального окна по ESC
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                hideAboutModal();
+                document.getElementById('windModal').style.display = 'none';
+            }
+        });
     </script>
 </body>
 </html>
@@ -949,9 +1128,9 @@ void setup() {
         peerInfo.channel = 0;
         peerInfo.encrypt = false;
         if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-            Serial.printf("❌ Не удалось добавить узел #%d!\n", i+1);
+            Serial.printf("❌ Не удалось добавить узел #%d!\n", nodeNumbers[i]);
         } else {
-            Serial.printf("✅ Узел #%d добавлен.\n", i+1);
+            Serial.printf("✅ Узел #%d добавлен.\n", nodeNumbers[i]);
         }
     }
 
@@ -970,7 +1149,8 @@ void setup() {
     Serial.println("1. Подключитесь к Wi-Fi: " + String(AP_SSID));
     Serial.println("2. Откройте: http://" + WiFi.softAPIP().toString());
     Serial.println("3. Ветер: желтый сектор 30 сек, штиль/шторм РАБОТАЕТ");
-    Serial.println("4. Поддерживается 4 узла (ID 101, 103, 104, 105)\n");
+    Serial.println("4. Поддерживается 4 узла (ID 102, 103, 104, 105)");
+    Serial.println("5. Версия хаба: 5.4, версия узлов: 2.1\n");
 }
 
 void loop() {
@@ -991,7 +1171,7 @@ void loop() {
 void sendConnectionStatusToWeb(int nodeIndex, bool connected) {
     StaticJsonDocument<100> doc;
     doc["type"] = connected ? "connection_restored" : "connection_lost";
-    doc["node"] = (nodeIndex == 0) ? 1 : (nodeIndex == 1 ? 3 : (nodeIndex == 2 ? 4 : 5));
+    doc["node"] = nodeNumbers[nodeIndex];
     String json;
     serializeJson(doc, json);
     ws.textAll(json);
@@ -1005,13 +1185,13 @@ void checkNodeConnection() {
                 if (!nodeConnectionLost[i]) {
                     nodeConnectionLost[i] = true;
                     connectionLostTime[i] = now;
-                    Serial.printf("⚠️ СВЯЗЬ С УЗЛОМ #%d ПОТЕРЯНА!\n", i == 0 ? 1 : (i == 1 ? 3 : (i == 2 ? 4 : 5)));
+                    Serial.printf("⚠️ СВЯЗЬ С УЗЛОМ #%d ПОТЕРЯНА!\n", nodeNumbers[i]);
                     sendConnectionStatusToWeb(i, false);
                 }
             } else {
                 if (nodeConnectionLost[i]) {
                     nodeConnectionLost[i] = false;
-                    Serial.printf("✅ СВЯЗЬ С УЗЛОМ #%d ВОССТАНОВЛЕНА!\n", i == 0 ? 1 : (i == 1 ? 3 : (i == 2 ? 4 : 5)));
+                    Serial.printf("✅ СВЯЗЬ С УЗЛОМ #%d ВОССТАНОВЛЕНА!\n", nodeNumbers[i]);
                     sendConnectionStatusToWeb(i, true);
                 }
             }
@@ -1031,16 +1211,16 @@ void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
         StaticJsonDocument<200> doc;
         if (!deserializeJson(doc, data, len) && doc.containsKey("command")) {
             String cmd = doc["command"].as<String>();
-            int targetNode = doc["node"] | 1; // По умолчанию узел #1
+            int targetNode = doc["node"] | 102; // По умолчанию узел #102
             
             // Определяем MAC по номеру узла
             uint8_t* targetMac = nullptr;
             switch(targetNode) {
-                case 1: targetMac = node1MacAddress; break;
-                case 3: targetMac = node3MacAddress; break;
-                case 4: targetMac = node4MacAddress; break;
-                case 5: targetMac = node5MacAddress; break;
-                default: targetMac = node1MacAddress;
+                case 102: targetMac = node102MacAddress; break;
+                case 103: targetMac = node103MacAddress; break;
+                case 104: targetMac = node104MacAddress; break;
+                case 105: targetMac = node105MacAddress; break;
+                default: targetMac = node102MacAddress;
             }
             
             if (targetMac) {
@@ -1096,7 +1276,7 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
     }
 
     const char* type = doc["type"];
-    int nodeId = (nodeIndex == 0) ? 1 : (nodeIndex == 1 ? 3 : (nodeIndex == 2 ? 4 : 5));
+    int nodeId = nodeNumbers[nodeIndex];
 
     if (strcmp(type, "sensor") == 0) {
         JsonObject dataObj = doc["data"];
@@ -1120,11 +1300,11 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         bool c1 = doc["contact1"];
         bool c2 = doc["contact2"];
         
-        if (alarm && !securityAlarmActive && nodeId == 1) { // Только для узла #1
+        if (alarm && !securityAlarmActive && nodeId == 102) { // Только для узла #102
             securityAlarmActive = true;
             alarmStartTime = millis();
             Serial.println("🚨 ТРЕВОГА!");
-        } else if (!alarm && nodeId == 1) {
+        } else if (!alarm && nodeId == 102) {
             securityAlarmActive = false;
         }
         
@@ -1173,7 +1353,7 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         ws.textAll(json);
     }
     else if (strcmp(type, "encoder") == 0) {
-        // Только для узла #1 (nodeIndex == 0)
+        // Только для узла #102 (nodeIndex == 0)
         if (nodeIndex == 0) {
             float angle = doc["angle"];
             bool magnet = doc["magnet"];
