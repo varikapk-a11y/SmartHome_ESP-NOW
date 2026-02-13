@@ -1,7 +1,8 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
- * 
- */ВЕРСИЯ 5.2: ПОЛНОСТЬЮ РАБОЧАЯ - ветер, желтый сектор 30 сек, штиль/шторм
+ * ВЕРСИЯ 5.3: ПОЛНОСТЬЮ РАБОЧАЯ - ветер, желтый сектор 30 сек, штиль/шторм
+ * Добавлена поддержка 4 узлов (ID 101, 103, 104, 105)
+ */
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <AsyncTCP.h>
@@ -13,10 +14,36 @@
 const char* AP_SSID = "SmartHome-Hub";
 const char* AP_PASSWORD = "12345678";
 
-// MAC нашего основного узла (ESP32-C3)
-uint8_t nodeMacAddress[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
+// MAC адреса узлов
+// Узел #1 (ID 101) - основной, с энкодером
+uint8_t node1MacAddress[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
+// Узел #3 (ID 103)
+uint8_t node3MacAddress[] = {0x88, 0x56, 0xA6, 0x7D, 0x09, 0x64};
+// Узел #4 (ID 104)
+uint8_t node4MacAddress[] = {0x10, 0x00, 0x3B, 0xB1, 0xA6, 0x9C};
+// Узел #5 (ID 105)
+uint8_t node5MacAddress[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28}; // Совпадает с #1? Уточни, если нужно изменить
+
 // MAC устройства "Теплица"
 uint8_t greenhouseMac[] = {0xE8, 0x9F, 0x6D, 0x87, 0x34, 0x8A};
+
+// Массив всех узлов для удобства
+#define NODE_COUNT 4
+uint8_t* nodeMacs[NODE_COUNT] = {
+    node1MacAddress,
+    node3MacAddress,
+    node4MacAddress,
+    node5MacAddress
+};
+
+// Время последнего получения данных от каждого узла
+unsigned long lastNodeDataTime[NODE_COUNT] = {0, 0, 0, 0};
+const unsigned long NODE_TIMEOUT_MS = 70000;
+
+// Флаги потери связи для каждого узла
+bool nodeConnectionLost[NODE_COUNT] = {false, false, false, false};
+unsigned long connectionLostTime[NODE_COUNT] = {0, 0, 0, 0};
+const unsigned long CONNECTION_LOST_COOLDOWN = 10000;
 
 // ---- 2. УНИВЕРСАЛЬНАЯ СТРУКТУРА ESP-NOW ----
 typedef struct esp_now_message {
@@ -45,14 +72,8 @@ AsyncWebSocket ws("/ws");
 esp_now_message outgoingMessage;
 esp_now_message incomingMessage;
 
-unsigned long lastNodeDataTime = 0;
 unsigned long lastGreenhouseUpdate = 0;
-const unsigned long NODE_TIMEOUT_MS = 70000;
 const unsigned long GREENHOUSE_UPDATE_INTERVAL = 30000;
-
-bool nodeConnectionLost = false;
-unsigned long connectionLostTime = 0;
-const unsigned long CONNECTION_LOST_COOLDOWN = 10000;
 
 bool securityAlarmActive = false;
 unsigned long alarmStartTime = 0;
@@ -85,13 +106,13 @@ void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                      AwsEventType type, void *arg, uint8_t *data, size_t len);
 void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
 void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
-void sendToNode(String cmd);
+void sendToNode(uint8_t* mac, String cmd);
 void processGreenhouseData(const uint8_t *data);
-void processNodeData(const uint8_t *data, int len);
+void processNodeData(const uint8_t *data, int len, int nodeIndex);
 String relayStateToString(uint32_t state);
 void checkNodeConnection();
 void updateAlarmState();
-void sendConnectionStatusToWeb(bool connected);
+void sendConnectionStatusToWeb(int nodeIndex, bool connected);
 void processEncoderData(float angle, bool magnet);
 void updateHistory(float angle);
 void updateMaxMin();
@@ -102,8 +123,8 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 5.2) ===");
-    Serial.println("=== ПОЛНОСТЬЮ РАБОЧАЯ ВЕРСИЯ ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 5.3) ===");
+    Serial.println("=== ПОДДЕРЖКА 4 УЗЛОВ ===");
 
     // ИНИЦИАЛИЗАЦИЯ ИСТОРИИ
     historyCount = 0;
@@ -413,21 +434,21 @@ void setup() {
         <button id="refreshBtn" onclick="refreshNodeData()">🔄 ОБНОВИТЬ ДАННЫЕ</button>
         
         <div class="section">
-            <div class="section-title">🔧 Мастерская</div>
+            <div class="section-title">🔧 Узел #1 (Мастерская)</div>
             <div class="section-info">MAC: AC:EB:E6:49:10:28</div>
             
-            <div id="securityStatus" class="security-status security-normal">
+            <div id="securityStatus1" class="security-status security-normal">
                 🔒 ОХРАНА: НОРМА (концевики замкнуты)
             </div>
             
-            <button id="ledToggleBtn" class="led-unknown" onclick="toggleLED()">--</button>
+            <button id="ledToggleBtn1" class="led-unknown" onclick="toggleLED(1)">--</button>
             <div class="clearfix"></div>
             
-            <div id="nodeSensorData">
+            <div id="nodeSensorData1">
                 <p>Нажмите "Обновить данные" для получения показаний</p>
             </div>
             
-            <!-- БЛОК ВЕТРА -->
+            <!-- БЛОК ВЕТРА (только для узла #1) -->
             <div id="windBlock" class="wind-compact" onclick="toggleWindSize()" style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed #ccc;">
                 <div style="display: flex; align-items: center; margin-bottom: 8px;">
                     <span style="font-weight: bold; color: #2c3e50; font-size: 1.1em;">🌪️ Ветер</span>
@@ -469,6 +490,54 @@ void setup() {
                         </div>
                     </div>
                 </div>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-title">🔧 Узел #3</div>
+            <div class="section-info">MAC: 88:56:A6:7D:09:64</div>
+            
+            <div id="securityStatus3" class="security-status security-normal">
+                🔒 ОХРАНА: НОРМА
+            </div>
+            
+            <button id="ledToggleBtn3" class="led-unknown" onclick="toggleLED(3)">--</button>
+            <div class="clearfix"></div>
+            
+            <div id="nodeSensorData3">
+                <p>Ожидание данных...</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-title">🔧 Узел #4</div>
+            <div class="section-info">MAC: 10:00:3B:B1:A6:9C</div>
+            
+            <div id="securityStatus4" class="security-status security-normal">
+                🔒 ОХРАНА: НОРМА
+            </div>
+            
+            <button id="ledToggleBtn4" class="led-unknown" onclick="toggleLED(4)">--</button>
+            <div class="clearfix"></div>
+            
+            <div id="nodeSensorData4">
+                <p>Ожидание данных...</p>
+            </div>
+        </div>
+
+        <div class="section">
+            <div class="section-title">🔧 Узел #5</div>
+            <div class="section-info">MAC: AC:EB:E6:49:10:28</div>
+            
+            <div id="securityStatus5" class="security-status security-normal">
+                🔒 ОХРАНА: НОРМА
+            </div>
+            
+            <button id="ledToggleBtn5" class="led-unknown" onclick="toggleLED(5)">--</button>
+            <div class="clearfix"></div>
+            
+            <div id="nodeSensorData5">
+                <p>Ожидание данных...</p>
             </div>
         </div>
 
@@ -530,8 +599,8 @@ void setup() {
 
     <script>
         const ws = new WebSocket('ws://' + window.location.hostname + '/ws');
-        let ledState = 'unknown';
-        let buttonLocked = false;
+        let ledState = {1: 'unknown', 3: 'unknown', 4: 'unknown', 5: 'unknown'};
+        let buttonLocked = {1: false, 3: false, 4: false, 5: false};
         let audioContext = null;
         let alarmInterval = null;
         let isAlarmPlaying = false;
@@ -626,13 +695,13 @@ void setup() {
             }
         }
 
-        function updateLEDButton() {
-            let btn = document.getElementById('ledToggleBtn');
-            if (ledState === 'on') {
+        function updateLEDButton(nodeId) {
+            let btn = document.getElementById('ledToggleBtn' + nodeId);
+            if (ledState[nodeId] === 'on') {
                 btn.textContent = '⏸ ВЫКЛЮЧИТЬ LED';
                 btn.className = 'led-on';
                 btn.disabled = false;
-            } else if (ledState === 'off') {
+            } else if (ledState[nodeId] === 'off') {
                 btn.textContent = '▶ ВКЛЮЧИТЬ LED';
                 btn.className = 'led-off';
                 btn.disabled = false;
@@ -643,39 +712,41 @@ void setup() {
             }
         }
 
-        function toggleLED() {
-            if (buttonLocked || ws.readyState !== WebSocket.OPEN) return;
-            let cmd = (ledState === 'on') ? 'LED_OFF' : 'LED_ON';
-            buttonLocked = true;
-            let btn = document.getElementById('ledToggleBtn');
+        function toggleLED(nodeId) {
+            if (buttonLocked[nodeId] || ws.readyState !== WebSocket.OPEN) return;
+            let cmd = (ledState[nodeId] === 'on') ? 'LED_OFF' : 'LED_ON';
+            buttonLocked[nodeId] = true;
+            let btn = document.getElementById('ledToggleBtn' + nodeId);
             btn.disabled = true;
-            setTimeout(() => { buttonLocked = false; updateLEDButton(); }, 5000);
-            ws.send(JSON.stringify({command: cmd}));
+            setTimeout(() => { buttonLocked[nodeId] = false; updateLEDButton(nodeId); }, 5000);
+            ws.send(JSON.stringify({command: cmd, node: nodeId}));
         }
 
         function refreshNodeData() {
-            document.getElementById('nodeSensorData').innerHTML = 
-                '<p style="color:#e74c3c;">⏳ Запрос данных отправлен...</p>';
+            for (let id of [1, 3, 4, 5]) {
+                document.getElementById('nodeSensorData' + id).innerHTML = 
+                    '<p style="color:#e74c3c;">⏳ Запрос данных отправлен...</p>';
+            }
             ws.send(JSON.stringify({command: 'GET_STATUS'}));
         }
 
-        function markNodeDataAsStale() {
-            let items = document.querySelectorAll('#nodeSensorData .sensor-item');
+        function markNodeDataAsStale(nodeId) {
+            let items = document.querySelectorAll('#nodeSensorData' + nodeId + ' .sensor-item');
             items.forEach(i => i.classList.add('stale-data'));
-            let vals = document.querySelectorAll('#nodeSensorData .sensor-value');
+            let vals = document.querySelectorAll('#nodeSensorData' + nodeId + ' .sensor-value');
             vals.forEach(v => v.classList.add('stale-data'));
             playShortBeep();
         }
 
-        function markNodeDataAsFresh() {
-            let items = document.querySelectorAll('#nodeSensorData .sensor-item');
+        function markNodeDataAsFresh(nodeId) {
+            let items = document.querySelectorAll('#nodeSensorData' + nodeId + ' .sensor-item');
             items.forEach(i => i.classList.remove('stale-data'));
-            let vals = document.querySelectorAll('#nodeSensorData .sensor-value');
+            let vals = document.querySelectorAll('#nodeSensorData' + nodeId + ' .sensor-value');
             vals.forEach(v => v.classList.remove('stale-data'));
         }
 
-        function updateSecurityStatus(alarm, c1, c2) {
-            let el = document.getElementById('securityStatus');
+        function updateSecurityStatus(nodeId, alarm, c1, c2) {
+            let el = document.getElementById('securityStatus' + nodeId);
             if (alarm) {
                 el.className = 'security-status security-alarm';
                 let txt = '🚨 ТРЕВОГА! ';
@@ -683,11 +754,11 @@ void setup() {
                 else if (c1) txt += 'Концевик 1 разорван';
                 else if (c2) txt += 'Концевик 2 разорван';
                 el.innerHTML = txt;
-                playAlarmTone();
+                if (nodeId === 1) playAlarmTone(); // Звук только для узла #1
             } else {
                 el.className = 'security-status security-normal';
                 el.innerHTML = '🔒 ОХРАНА: НОРМА';
-                stopAlarm();
+                if (nodeId === 1) stopAlarm();
             }
         }
 
@@ -727,11 +798,12 @@ void setup() {
             let msg = JSON.parse(event.data);
             
             if (msg.type === 'node_status') {
-                ledState = msg.state;
-                buttonLocked = false;
-                updateLEDButton();
+                ledState[msg.node] = msg.state;
+                buttonLocked[msg.node] = false;
+                updateLEDButton(msg.node);
             }
             else if (msg.type === 'sensor_data') {
+                let nodeId = msg.node;
                 let html = '<div class="sensor-grid">';
                 if (msg.aht20) {
                     html += `<div class="sensor-item"><span class="sensor-label">AHT20:</span><span class="sensor-value">${msg.aht20.temp}</span><span class="sensor-unit">°C</span></div>`;
@@ -742,21 +814,21 @@ void setup() {
                     html += `<div class="sensor-item"><span class="sensor-label">BMP280:</span><span class="sensor-value">${msg.bmp280.press}</span><span class="sensor-unit">mmHg</span></div>`;
                 }
                 html += '</div>';
-                document.getElementById('nodeSensorData').innerHTML = html;
+                document.getElementById('nodeSensorData' + nodeId).innerHTML = html;
             }
             else if (msg.type === 'security') {
-                updateSecurityStatus(msg.alarm, msg.contact1, msg.contact2);
+                updateSecurityStatus(msg.node, msg.alarm, msg.contact1, msg.contact2);
             }
             else if (msg.type === 'connection_lost') {
-                markNodeDataAsStale();
+                markNodeDataAsStale(msg.node);
             }
             else if (msg.type === 'connection_restored') {
-                markNodeDataAsFresh();
+                markNodeDataAsFresh(msg.node);
             }
             else if (msg.type === 'gpio_status') {
                 if (msg.gpio8 !== undefined) {
-                    ledState = msg.gpio8 ? 'on' : 'off';
-                    updateLEDButton();
+                    ledState[msg.node] = msg.gpio8 ? 'on' : 'off';
+                    updateLEDButton(msg.node);
                 }
             }
             else if (msg.type === 'greenhouse_data') {
@@ -797,7 +869,6 @@ void setup() {
                     magnetText.style.color = '#e74c3c';
                 }
                 
-                // СТАБИЛЬНОСТЬ ВЕТРА - РАБОТАЕТ!
                 let stability = msg.stability;
                 let badge = document.getElementById('stabilityBadge');
                 let badgeLarge = document.getElementById('stabilityBadgeLarge');
@@ -818,35 +889,38 @@ void setup() {
                     badgeLarge.style.backgroundColor = color;
                 }
                 
-                // Рисуем красный сектор (текущий размах)
                 if (msg.sector_start !== undefined && msg.sector_end !== undefined) {
                     drawSector('windSector', parseFloat(msg.sector_start), parseFloat(msg.sector_end));
                     drawSector('windSectorLarge', parseFloat(msg.sector_start), parseFloat(msg.sector_end));
                 }
                 
-                // Рисуем желтый сектор (мин-макс за 30 сек)
                 if (msg.history_min !== undefined && msg.history_max !== undefined) {
                     drawSector('windSectorMax', parseFloat(msg.history_min), parseFloat(msg.history_max));
                     drawSector('windSectorMaxLarge', parseFloat(msg.history_min), parseFloat(msg.history_max));
                 }
                 
-                // Поворачиваем стрелку
                 rotateArrow('windArrow', parseFloat(msg.angle_avg));
                 rotateArrow('windArrowLarge', parseFloat(msg.angle_avg));
             }
         };
 
         ws.onopen = function() {
-            updateLEDButton();
+            for (let id of [1, 3, 4, 5]) {
+                updateLEDButton(id);
+            }
             ws.send(JSON.stringify({command: 'GET_STATUS'}));
         };
 
         ws.onclose = function() {
-            ledState = 'unknown';
-            updateLEDButton();
+            for (let id of [1, 3, 4, 5]) {
+                ledState[id] = 'unknown';
+                updateLEDButton(id);
+            }
         };
 
-        updateLEDButton();
+        for (let id of [1, 3, 4, 5]) {
+            updateLEDButton(id);
+        }
     </script>
 </body>
 </html>
@@ -868,16 +942,20 @@ void setup() {
     esp_now_register_send_cb(onEspNowDataSent);
     esp_now_register_recv_cb(onEspNowDataRecv);
 
-    esp_now_peer_info_t peerInfo = {};
-    memcpy(peerInfo.peer_addr, nodeMacAddress, 6);
-    peerInfo.channel = 0;
-    peerInfo.encrypt = false;
-    if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-        Serial.println("❌ Не удалось добавить основной узел!");
-    } else {
-        Serial.println("✅ Основной узел добавлен.");
+    // Добавление всех узлов как пиров
+    for (int i = 0; i < NODE_COUNT; i++) {
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, nodeMacs[i], 6);
+        peerInfo.channel = 0;
+        peerInfo.encrypt = false;
+        if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+            Serial.printf("❌ Не удалось добавить узел #%d!\n", i+1);
+        } else {
+            Serial.printf("✅ Узел #%d добавлен.\n", i+1);
+        }
     }
 
+    // Добавление теплицы
     esp_now_peer_info_t greenhousePeerInfo = {};
     memcpy(greenhousePeerInfo.peer_addr, greenhouseMac, 6);
     greenhousePeerInfo.channel = 0;
@@ -891,7 +969,8 @@ void setup() {
     Serial.println("\n=== ХАБ ГОТОВ К РАБОТЕ ===");
     Serial.println("1. Подключитесь к Wi-Fi: " + String(AP_SSID));
     Serial.println("2. Откройте: http://" + WiFi.softAPIP().toString());
-    Serial.println("3. Ветер: желтый сектор 30 сек, штиль/шторм РАБОТАЕТ\n");
+    Serial.println("3. Ветер: желтый сектор 30 сек, штиль/шторм РАБОТАЕТ");
+    Serial.println("4. Поддерживается 4 узла (ID 101, 103, 104, 105)\n");
 }
 
 void loop() {
@@ -909,9 +988,10 @@ void loop() {
     delay(100);
 }
 
-void sendConnectionStatusToWeb(bool connected) {
+void sendConnectionStatusToWeb(int nodeIndex, bool connected) {
     StaticJsonDocument<100> doc;
     doc["type"] = connected ? "connection_restored" : "connection_lost";
+    doc["node"] = (nodeIndex == 0) ? 1 : (nodeIndex == 1 ? 3 : (nodeIndex == 2 ? 4 : 5));
     String json;
     serializeJson(doc, json);
     ws.textAll(json);
@@ -919,19 +999,21 @@ void sendConnectionStatusToWeb(bool connected) {
 
 void checkNodeConnection() {
     unsigned long now = millis();
-    if (lastNodeDataTime > 0) {
-        if (now - lastNodeDataTime > NODE_TIMEOUT_MS) {
-            if (!nodeConnectionLost) {
-                nodeConnectionLost = true;
-                connectionLostTime = now;
-                Serial.println("⚠️ СВЯЗЬ С УЗЛОМ ПОТЕРЯНА!");
-                sendConnectionStatusToWeb(false);
-            }
-        } else {
-            if (nodeConnectionLost) {
-                nodeConnectionLost = false;
-                Serial.println("✅ СВЯЗЬ С УЗЛОМ ВОССТАНОВЛЕНА!");
-                sendConnectionStatusToWeb(true);
+    for (int i = 0; i < NODE_COUNT; i++) {
+        if (lastNodeDataTime[i] > 0) {
+            if (now - lastNodeDataTime[i] > NODE_TIMEOUT_MS) {
+                if (!nodeConnectionLost[i]) {
+                    nodeConnectionLost[i] = true;
+                    connectionLostTime[i] = now;
+                    Serial.printf("⚠️ СВЯЗЬ С УЗЛОМ #%d ПОТЕРЯНА!\n", i == 0 ? 1 : (i == 1 ? 3 : (i == 2 ? 4 : 5)));
+                    sendConnectionStatusToWeb(i, false);
+                }
+            } else {
+                if (nodeConnectionLost[i]) {
+                    nodeConnectionLost[i] = false;
+                    Serial.printf("✅ СВЯЗЬ С УЗЛОМ #%d ВОССТАНОВЛЕНА!\n", i == 0 ? 1 : (i == 1 ? 3 : (i == 2 ? 4 : 5)));
+                    sendConnectionStatusToWeb(i, true);
+                }
             }
         }
     }
@@ -948,35 +1030,56 @@ void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
     if (type == WS_EVT_DATA) {
         StaticJsonDocument<200> doc;
         if (!deserializeJson(doc, data, len) && doc.containsKey("command")) {
-            sendToNode(doc["command"].as<String>());
+            String cmd = doc["command"].as<String>();
+            int targetNode = doc["node"] | 1; // По умолчанию узел #1
+            
+            // Определяем MAC по номеру узла
+            uint8_t* targetMac = nullptr;
+            switch(targetNode) {
+                case 1: targetMac = node1MacAddress; break;
+                case 3: targetMac = node3MacAddress; break;
+                case 4: targetMac = node4MacAddress; break;
+                case 5: targetMac = node5MacAddress; break;
+                default: targetMac = node1MacAddress;
+            }
+            
+            if (targetMac) {
+                sendToNode(targetMac, cmd);
+            }
         }
     }
 }
 
-void sendToNode(String cmd) {
+void sendToNode(uint8_t* mac, String cmd) {
     char json_cmd[64];
     snprintf(json_cmd, sizeof(json_cmd), "{\"type\":\"command\",\"command\":\"%s\"}", cmd.c_str());
     strncpy(outgoingMessage.json, json_cmd, sizeof(outgoingMessage.json)-1);
     outgoingMessage.json[sizeof(outgoingMessage.json)-1] = '\0';
     outgoingMessage.sender_id = 1;
-    esp_now_send(nodeMacAddress, (uint8_t*)&outgoingMessage, sizeof(outgoingMessage));
+    esp_now_send(mac, (uint8_t*)&outgoingMessage, sizeof(outgoingMessage));
 }
 
 void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
 
 void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
-    if (memcmp(mac_addr, nodeMacAddress, 6) == 0) {
-        lastNodeDataTime = millis();
-        processNodeData(incomingData, len);
+    // Проверяем, от какого узла пришли данные
+    for (int i = 0; i < NODE_COUNT; i++) {
+        if (memcmp(mac_addr, nodeMacs[i], 6) == 0) {
+            lastNodeDataTime[i] = millis();
+            processNodeData(incomingData, len, i);
+            return;
+        }
     }
-    else if (memcmp(mac_addr, greenhouseMac, 6) == 0) {
+    
+    // Проверяем теплицу
+    if (memcmp(mac_addr, greenhouseMac, 6) == 0) {
         if (len == sizeof(greenhouse_packet)) {
             processGreenhouseData(incomingData);
         }
     }
 }
 
-void processNodeData(const uint8_t *data, int len) {
+void processNodeData(const uint8_t *data, int len, int nodeIndex) {
     if (len > sizeof(incomingMessage)) {
         Serial.println("❌ Пакет слишком большой!");
         return;
@@ -993,11 +1096,13 @@ void processNodeData(const uint8_t *data, int len) {
     }
 
     const char* type = doc["type"];
+    int nodeId = (nodeIndex == 0) ? 1 : (nodeIndex == 1 ? 3 : (nodeIndex == 2 ? 4 : 5));
 
     if (strcmp(type, "sensor") == 0) {
         JsonObject dataObj = doc["data"];
         StaticJsonDocument<300> resp;
         resp["type"] = "sensor_data";
+        resp["node"] = nodeId;
         if (dataObj.containsKey("AHT20")) {
             resp["aht20"]["temp"] = dataObj["AHT20"]["temp"].as<String>();
             resp["aht20"]["hum"] = dataObj["AHT20"]["hum"].as<String>();
@@ -1015,16 +1120,17 @@ void processNodeData(const uint8_t *data, int len) {
         bool c1 = doc["contact1"];
         bool c2 = doc["contact2"];
         
-        if (alarm && !securityAlarmActive) {
+        if (alarm && !securityAlarmActive && nodeId == 1) { // Только для узла #1
             securityAlarmActive = true;
             alarmStartTime = millis();
             Serial.println("🚨 ТРЕВОГА!");
-        } else if (!alarm) {
+        } else if (!alarm && nodeId == 1) {
             securityAlarmActive = false;
         }
         
         StaticJsonDocument<200> resp;
         resp["type"] = "security";
+        resp["node"] = nodeId;
         resp["alarm"] = alarm;
         resp["contact1"] = c1;
         resp["contact2"] = c2;
@@ -1037,6 +1143,7 @@ void processNodeData(const uint8_t *data, int len) {
         if (strcmp(cmd, "LED_ON") == 0) {
             StaticJsonDocument<200> resp;
             resp["type"] = "node_status";
+            resp["node"] = nodeId;
             resp["state"] = "on";
             String json;
             serializeJson(resp, json);
@@ -1045,6 +1152,7 @@ void processNodeData(const uint8_t *data, int len) {
         else if (strcmp(cmd, "LED_OFF") == 0) {
             StaticJsonDocument<200> resp;
             resp["type"] = "node_status";
+            resp["node"] = nodeId;
             resp["state"] = "off";
             String json;
             serializeJson(resp, json);
@@ -1054,6 +1162,7 @@ void processNodeData(const uint8_t *data, int len) {
     else if (strcmp(type, "gpio") == 0) {
         StaticJsonDocument<200> resp;
         resp["type"] = "gpio_status";
+        resp["node"] = nodeId;
         if (doc.containsKey("pin") && doc.containsKey("state")) {
             int pin = doc["pin"];
             int state = doc["state"];
@@ -1064,12 +1173,15 @@ void processNodeData(const uint8_t *data, int len) {
         ws.textAll(json);
     }
     else if (strcmp(type, "encoder") == 0) {
-        float angle = doc["angle"];
-        bool magnet = doc["magnet"];
-        
-        if (magnet) {
-            processEncoderData(angle, true);
-            updateHistory(angle);
+        // Только для узла #1 (nodeIndex == 0)
+        if (nodeIndex == 0) {
+            float angle = doc["angle"];
+            bool magnet = doc["magnet"];
+            
+            if (magnet) {
+                processEncoderData(angle, true);
+                updateHistory(angle);
+            }
         }
     }
 }
