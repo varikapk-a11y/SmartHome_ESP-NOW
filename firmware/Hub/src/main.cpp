@@ -1,6 +1,6 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
- * ВЕРСИЯ 5.5: ГЛОБАЛЬНАЯ ТРЕВОГА (логическое ИЛИ для всех узлов)
+ * ВЕРСИЯ 5.7: УСТАВКИ ДЛЯ ВСЕХ ДАТЧИКОВ + ПРОГНОЗ ПОГОДЫ
  * Добавлена поддержка 4 узлов (ID 102, 103, 104, 105)
  * Добавлена кнопка "О системе" с версиями прошивок
  */
@@ -10,13 +10,14 @@
 #include <esp_now.h>
 #include <ArduinoJson.h>
 #include <math.h>
+#include <Preferences.h>
 
 // ---- 1. КОНФИГУРАЦИЯ ----
 const char* AP_SSID = "SmartHome-Hub";
 const char* AP_PASSWORD = "12345678";
 
 // Версии прошивок
-const char* HUB_VERSION = "5.5";
+const char* HUB_VERSION = "5.7";
 const char* NODE_VERSION = "2.1";  // Все узлы используют одну версию
 
 // MAC адреса узлов
@@ -53,12 +54,12 @@ bool nodeConnectionLost[NODE_COUNT] = {false, false, false, false};
 unsigned long connectionLostTime[NODE_COUNT] = {0, 0, 0, 0};
 const unsigned long CONNECTION_LOST_COOLDOWN = 10000;
 
-// Статусы тревоги для каждого узла (ДОБАВЛЕНО для глобальной тревоги)
+// Статусы тревоги для каждого узла (для глобальной тревоги, но без вывода в веб)
 bool nodeAlarmState[NODE_COUNT] = {false, false, false, false};
 
 // ---- 2. УНИВЕРСАЛЬНАЯ СТРУКТУРА ESP-NOW ----
 typedef struct esp_now_message {
-    char json[192];
+    char json[256];
     uint8_t sender_id;
 } esp_now_message;
 
@@ -90,12 +91,57 @@ bool securityAlarmActive = false;
 unsigned long alarmStartTime = 0;
 const unsigned long ALARM_DURATION_MS = 10000;
 
-// Глобальная тревога (ДОБАВЛЕНО)
+// Глобальная тревога (только для логики, без вывода в веб)
 bool globalAlarmActive = false;
 
-// ---- 5. ДАННЫЕ ЭНКОДЕРА AS5600 - ДВЕ ТОЧКИ + ИСТОРИЯ 30 СЕК ----
+// Для хранения уставок
+Preferences prefs;
+
+// ---- 5. СТРУКТУРА УСТАВОК ДЛЯ ДАТЧИКОВ ----
+struct SensorLimit {
+    bool enabled;
+    float value;
+};
+
+struct NodeLimits {
+    SensorLimit temp_min;
+    SensorLimit temp_max;
+    SensorLimit hum_min;
+    SensorLimit hum_max;
+    SensorLimit press_min;
+    SensorLimit press_max;
+    SensorLimit wind_storm;      // порог шторма (м/с)
+    SensorLimit wind_change;      // порог смены направления (градусы)
+};
+
+// Уставки для каждого узла
+NodeLimits nodeLimits[NODE_COUNT];
+
+// История давления для прогноза
+#define PRESSURE_HISTORY_SIZE 12  // 12 значений = 3 часа при 15 мин интервале
+float pressureHistory[NODE_COUNT][PRESSURE_HISTORY_SIZE];
+unsigned long pressureTimestamps[NODE_COUNT][PRESSURE_HISTORY_SIZE];
+int pressureIndex[NODE_COUNT] = {0, 0, 0, 0};
+int pressureCount[NODE_COUNT] = {0, 0, 0, 0};
+
+// История ветра для определения смены направления
+#define WIND_HISTORY_SIZE 30  // 30 значений = 30 минут при 1 мин интервале (будем накапливать)
+float windDirectionHistory[WIND_HISTORY_SIZE];
+unsigned long windDirectionTimestamps[WIND_HISTORY_SIZE];
+int windDirectionIndex = 0;
+int windDirectionCount = 0;
+
+// История влажности для детекции дождя
+#define HUMIDITY_HISTORY_SIZE 12  // 12 значений = 1 час при 5 мин интервале
+float humidityHistory[NODE_COUNT][HUMIDITY_HISTORY_SIZE];
+unsigned long humidityTimestamps[NODE_COUNT][HUMIDITY_HISTORY_SIZE];
+int humidityIndex[NODE_COUNT] = {0, 0, 0, 0};
+int humidityCount[NODE_COUNT] = {0, 0, 0, 0};
+
+// ---- 6. ДАННЫЕ ЭНКОДЕРА AS5600 - ДВЕ ТОЧКИ + ИСТОРИЯ 30 СЕК ----
 #define ENCODER_HISTORY_SIZE 6        // 6 значений = 30 секунд при 5 сек
 #define ENCODER_BROADCAST_INTERVAL 5000
+#define ENCODER_TIMEOUT_MS 10000      // 10 сек без данных - тревога
 
 // Текущие две точки
 float prevEncoderAngle = -1.0;
@@ -103,6 +149,7 @@ float currentEncoderAngle = -1.0;
 float windDirection = 0.0;
 float windCurrentSector = 0.0;
 bool windMagnet = false;
+unsigned long lastEncoderDataTime = 0;  // Для отслеживания потери сигнала
 
 // История для желтого сектора
 float encoderHistory[ENCODER_HISTORY_SIZE];
@@ -115,7 +162,7 @@ float maxAngle = -1.0;
 float minAngle = 361.0;
 unsigned long lastEncoderBroadcastTime = 0;
 
-// ---- 6. ПРОТОТИПЫ ----
+// ---- 7. ПРОТОТИПЫ ----
 void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                      AwsEventType type, void *arg, uint8_t *data, size_t len);
 void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
@@ -131,21 +178,33 @@ void processEncoderData(float angle, bool magnet);
 void updateHistory(float angle);
 void updateMaxMin();
 void broadcastEncoderData();
-void checkGlobalAlarm();  // ДОБАВЛЕНО
+void checkGlobalAlarm();
+void loadLimitsFromPrefs();
+void saveLimitsToPrefs();
+void updatePressureHistory(int nodeIndex, float pressure);
+String getWeatherForecast(int nodeIndex);
+void updateWindDirectionHistory(float direction);
+void updateHumidityHistory(int nodeIndex, float humidity);
+void checkWeatherAlarms(int nodeIndex);
 
 // ===================== SETUP =====================
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 5.5) ===");
-    Serial.println("=== ГЛОБАЛЬНАЯ ТРЕВОГА ДЛЯ ВСЕХ УЗЛОВ ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 5.7) ===");
+    Serial.println("=== УСТАВКИ ДЛЯ ВСЕХ ДАТЧИКОВ + ПРОГНОЗ ПОГОДЫ ===");
 
     // ИНИЦИАЛИЗАЦИЯ ИСТОРИИ
     historyCount = 0;
     historyIndex = 0;
     minAngle = 361.0;
     maxAngle = -1.0;
+    lastEncoderDataTime = 0;
+    
+    // Загрузка уставок из памяти
+    prefs.begin("hub", false);
+    loadLimitsFromPrefs();
 
     WiFi.mode(WIFI_AP);
     if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
@@ -221,23 +280,6 @@ void setup() {
             transform: translateY(-2px);
             box-shadow: 0 4px 8px rgba(0,0,0,0.1);
         }
-        .global-alarm-banner {
-            background: #ff4444;
-            color: white;
-            padding: 15px;
-            border-radius: 10px;
-            margin: 20px 0;
-            text-align: center;
-            font-size: 24px;
-            font-weight: bold;
-            animation: alarm-pulse 1s infinite;
-            display: none;
-        }
-        @keyframes alarm-pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.7; }
-            100% { opacity: 1; }
-        }
         .section {
             background: #f9f9f9;
             border-radius: 10px;
@@ -268,21 +310,36 @@ void setup() {
         }
         .sensor-item {
             background: white;
-            padding: 8px 12px;
-            border-radius: 6px;
+            padding: 12px;
+            border-radius: 8px;
             border-left: 4px solid #3498db;
-            transition: all 0.3s;
-            min-height: 60px;
+            cursor: pointer;
+            transition: all 0.2s;
+            position: relative;
+            min-height: 80px;
             display: flex;
             flex-direction: column;
             justify-content: center;
         }
+        .sensor-item:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+        .sensor-item.alarm {
+            border-left: 4px solid #e74c3c;
+            background: #fff5f5;
+        }
+        .sensor-item.warning {
+            border-left: 4px solid #f39c12;
+            background: #fff9e6;
+        }
         .sensor-label {
             font-weight: bold;
             color: #555;
-            display: block;
-            margin-bottom: 2px;
             font-size: 0.85em;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
         .sensor-value {
             font-size: 1.5em;
@@ -296,67 +353,50 @@ void setup() {
             color: #7f8c8d;
             margin-left: 2px;
         }
-        .sensor-item.stale-data {
-            border-left: 4px solid #e74c3c !important;
-            opacity: 0.7;
+        .sensor-limits {
+            font-size: 0.7em;
+            color: #7f8c8d;
+            margin-top: 4px;
+            font-family: monospace;
         }
-        .relay-status {
+        .sensor-limits.active {
+            color: #e67e22;
+            font-weight: bold;
+        }
+        .limits-indicator {
             display: inline-block;
-            padding: 3px 8px;
+            background: #e67e22;
+            color: white;
+            padding: 2px 8px;
             border-radius: 12px;
-            font-weight: bold;
-            margin-top: 3px;
-            font-size: 0.85em;
+            font-size: 10px;
+            margin-left: 8px;
         }
-        .relay-on {
-            background-color: #27ae60;
-            color: white;
-        }
-        .relay-off {
-            background-color: #e74c3c;
-            color: white;
-        }
-        .led-toggle-btn {
-            font-size: 15px;
-            padding: 10px 20px;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            color: white;
-            font-weight: bold;
-            transition: all 0.3s;
-            width: 280px;
-            margin: 12px 0;
-            float: left;
-            min-height: 50px;
-        }
-        .led-toggle-btn.led-on {
-            background: linear-gradient(135deg, #e74c3c, #c0392b);
-        }
-        .led-toggle-btn.led-off {
-            background: linear-gradient(135deg, #2ecc71, #27ae60);
-        }
-        .led-toggle-btn.led-unknown {
-            background: #95a5a6;
-            cursor: not-allowed;
-        }
-        .security-status {
-            padding: 10px;
+        .weather-forecast {
+            margin-top: 10px;
+            padding: 8px;
+            background: #e8f4fd;
             border-radius: 6px;
-            margin-top: 12px;
+            font-size: 0.9em;
             text-align: center;
-            font-weight: bold;
-            font-size: 0.95em;
-            transition: all 0.3s;
         }
-        .security-normal {
-            background: linear-gradient(135deg, #27ae60, #2ecc71);
-            color: white;
+        .weather-forecast.rain {
+            background: #d4e6f1;
+            color: #2875a7;
         }
-        .security-alarm {
-            background: linear-gradient(135deg, #e74c3c, #c0392b);
-            color: white;
+        .weather-forecast.sun {
+            background: #fcf3cf;
+            color: #b7950b;
+        }
+        .weather-forecast.storm {
+            background: #fadbd8;
+            color: #c0392b;
             animation: alarm-pulse 1s infinite;
+        }
+        @keyframes alarm-pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
         }
         
         /* Компас */
@@ -411,6 +451,9 @@ void setup() {
             font-weight: bold;
             color: white;
             margin-left: 8px;
+        }
+        .wind-badge.warning {
+            background: #ffa500 !important;
         }
         .wind-modal {
             display: none;
@@ -468,6 +511,14 @@ void setup() {
             height: 12px;
             background: #f1c40f;
             opacity: 0.7;
+            border-radius: 2px;
+            margin-right: 4px;
+        }
+        .legend-orange {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background: #ffa500;
             border-radius: 2px;
             margin-right: 4px;
         }
@@ -554,6 +605,131 @@ void setup() {
         .about-description li {
             margin: 5px 0;
         }
+        
+        /* Модальное окно уставок */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 10000;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-content {
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            max-width: 400px;
+            width: 90%;
+            position: relative;
+        }
+        .modal-close {
+            position: absolute;
+            top: 15px;
+            right: 20px;
+            font-size: 28px;
+            font-weight: bold;
+            color: #7f8c8d;
+            cursor: pointer;
+        }
+        .modal-close:hover {
+            color: #e74c3c;
+        }
+        .modal-title {
+            font-size: 20px;
+            color: #2c3e50;
+            margin-bottom: 20px;
+            text-align: center;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+        }
+        .limits-form {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .limit-row {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 10px;
+            background: #f5f5f5;
+            border-radius: 8px;
+        }
+        .limit-label {
+            width: 60px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .limit-checkbox {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+        .limit-input {
+            width: 100px;
+            padding: 8px;
+            border: 2px solid #bdc3c7;
+            border-radius: 5px;
+            font-size: 16px;
+            text-align: center;
+        }
+        .limit-input:focus {
+            border-color: #3498db;
+            outline: none;
+        }
+        .limit-buttons {
+            display: flex;
+            gap: 5px;
+        }
+        .limit-btn {
+            width: 40px;
+            height: 40px;
+            border: none;
+            border-radius: 5px;
+            background: #3498db;
+            color: white;
+            font-size: 18px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .limit-btn:hover {
+            background: #2980b9;
+        }
+        .limit-btn:active {
+            transform: scale(0.95);
+        }
+        .save-btn {
+            background: #27ae60;
+            color: white;
+            border: none;
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        .save-btn:hover {
+            background: #2ecc71;
+        }
+        .forecast-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: bold;
+            color: white;
+            margin-left: 8px;
+        }
+        .forecast-rain { background: #3498db; }
+        .forecast-sun { background: #f39c12; }
+        .forecast-cloud { background: #95a5a6; }
+        .forecast-storm { background: #e74c3c; animation: alarm-pulse 1s infinite; }
     </style>
 </head>
 <body>
@@ -562,11 +738,6 @@ void setup() {
         
         <button id="refreshBtn" onclick="refreshAllData()">🔄 ОБНОВИТЬ ВСЕ ДАННЫЕ</button>
         <button id="aboutBtn" onclick="showAboutModal()">ℹ️ О СИСТЕМЕ</button>
-        
-        <!-- Глобальная тревога (ДОБАВЛЕНО) -->
-        <div id="globalAlarmBanner" class="global-alarm-banner">
-            🚨 ГЛОБАЛЬНАЯ ТРЕВОГА 🚨
-        </div>
         
         <div class="section">
             <div class="section-title">🔧 Узел #102 (Мастерская, с энкодером)</div>
@@ -580,7 +751,52 @@ void setup() {
             <div class="clearfix"></div>
             
             <div id="nodeSensorData102">
-                <p>Нажмите "Обновить все данные" для получения показаний</p>
+                <div class="sensor-grid">
+                    <!-- Температура -->
+                    <div class="sensor-item" id="sensor-temp-102" onclick="openLimitsModal('temp', 102)">
+                        <div class="sensor-label">
+                            🌡️ Температура
+                            <span class="limits-indicator" id="temp-indicator-102" style="display: none;">⚙️</span>
+                        </div>
+                        <div>
+                            <span class="sensor-value" id="temp-value-102">--</span>
+                            <span class="sensor-unit">°C</span>
+                        </div>
+                        <div class="sensor-limits" id="temp-limits-102"></div>
+                    </div>
+                    
+                    <!-- Влажность -->
+                    <div class="sensor-item" id="sensor-hum-102" onclick="openLimitsModal('hum', 102)">
+                        <div class="sensor-label">
+                            💧 Влажность
+                            <span class="limits-indicator" id="hum-indicator-102" style="display: none;">⚙️</span>
+                        </div>
+                        <div>
+                            <span class="sensor-value" id="hum-value-102">--</span>
+                            <span class="sensor-unit">%</span>
+                        </div>
+                        <div class="sensor-limits" id="hum-limits-102"></div>
+                    </div>
+                    
+                    <!-- Давление -->
+                    <div class="sensor-item" id="sensor-press-102" onclick="openLimitsModal('press', 102)">
+                        <div class="sensor-label">
+                            📊 Давление
+                            <span class="limits-indicator" id="press-indicator-102" style="display: none;">⚙️</span>
+                            <span id="press-forecast-102" class="forecast-badge"></span>
+                        </div>
+                        <div>
+                            <span class="sensor-value" id="press-value-102">--</span>
+                            <span class="sensor-unit">mmHg</span>
+                        </div>
+                        <div class="sensor-limits" id="press-limits-102"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Прогноз погоды -->
+            <div id="weather-forecast-102" class="weather-forecast">
+                🌤️ Прогноз: стабильно
             </div>
             
             <!-- БЛОК ВЕТРА (только для узла #102) -->
@@ -589,6 +805,7 @@ void setup() {
                     <span style="font-weight: bold; color: #2c3e50; font-size: 1.1em;">🌪️ Ветер</span>
                     <span id="magnetIndicator" style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-left: 8px; background-color: #95a5a6;"></span>
                     <span id="magnetText" style="margin-left: 4px; font-size: 0.8em; color: #7f8c8d;">магнит</span>
+                    <span id="wind-change-indicator" class="forecast-badge" style="display: none;">↺</span>
                 </div>
                 
                 <div style="display: flex; align-items: center;">
@@ -622,6 +839,7 @@ void setup() {
                         <div class="wind-legend">
                             <span><span class="legend-red"></span> текущий</span>
                             <span><span class="legend-yellow"></span> мин-макс за 30 сек</span>
+                            <span><span class="legend-orange"></span> нет сигнала</span>
                         </div>
                     </div>
                 </div>
@@ -640,7 +858,52 @@ void setup() {
             <div class="clearfix"></div>
             
             <div id="nodeSensorData103">
-                <p>Ожидание данных...</p>
+                <div class="sensor-grid">
+                    <!-- Температура -->
+                    <div class="sensor-item" id="sensor-temp-103" onclick="openLimitsModal('temp', 103)">
+                        <div class="sensor-label">
+                            🌡️ Температура
+                            <span class="limits-indicator" id="temp-indicator-103" style="display: none;">⚙️</span>
+                        </div>
+                        <div>
+                            <span class="sensor-value" id="temp-value-103">--</span>
+                            <span class="sensor-unit">°C</span>
+                        </div>
+                        <div class="sensor-limits" id="temp-limits-103"></div>
+                    </div>
+                    
+                    <!-- Влажность -->
+                    <div class="sensor-item" id="sensor-hum-103" onclick="openLimitsModal('hum', 103)">
+                        <div class="sensor-label">
+                            💧 Влажность
+                            <span class="limits-indicator" id="hum-indicator-103" style="display: none;">⚙️</span>
+                        </div>
+                        <div>
+                            <span class="sensor-value" id="hum-value-103">--</span>
+                            <span class="sensor-unit">%</span>
+                        </div>
+                        <div class="sensor-limits" id="hum-limits-103"></div>
+                    </div>
+                    
+                    <!-- Давление -->
+                    <div class="sensor-item" id="sensor-press-103" onclick="openLimitsModal('press', 103)">
+                        <div class="sensor-label">
+                            📊 Давление
+                            <span class="limits-indicator" id="press-indicator-103" style="display: none;">⚙️</span>
+                            <span id="press-forecast-103" class="forecast-badge"></span>
+                        </div>
+                        <div>
+                            <span class="sensor-value" id="press-value-103">--</span>
+                            <span class="sensor-unit">mmHg</span>
+                        </div>
+                        <div class="sensor-limits" id="press-limits-103"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Прогноз погоды -->
+            <div id="weather-forecast-103" class="weather-forecast">
+                🌤️ Прогноз: стабильно
             </div>
         </div>
 
@@ -656,7 +919,52 @@ void setup() {
             <div class="clearfix"></div>
             
             <div id="nodeSensorData104">
-                <p>Ожидание данных...</p>
+                <div class="sensor-grid">
+                    <!-- Температура -->
+                    <div class="sensor-item" id="sensor-temp-104" onclick="openLimitsModal('temp', 104)">
+                        <div class="sensor-label">
+                            🌡️ Температура
+                            <span class="limits-indicator" id="temp-indicator-104" style="display: none;">⚙️</span>
+                        </div>
+                        <div>
+                            <span class="sensor-value" id="temp-value-104">--</span>
+                            <span class="sensor-unit">°C</span>
+                        </div>
+                        <div class="sensor-limits" id="temp-limits-104"></div>
+                    </div>
+                    
+                    <!-- Влажность -->
+                    <div class="sensor-item" id="sensor-hum-104" onclick="openLimitsModal('hum', 104)">
+                        <div class="sensor-label">
+                            💧 Влажность
+                            <span class="limits-indicator" id="hum-indicator-104" style="display: none;">⚙️</span>
+                        </div>
+                        <div>
+                            <span class="sensor-value" id="hum-value-104">--</span>
+                            <span class="sensor-unit">%</span>
+                        </div>
+                        <div class="sensor-limits" id="hum-limits-104"></div>
+                    </div>
+                    
+                    <!-- Давление -->
+                    <div class="sensor-item" id="sensor-press-104" onclick="openLimitsModal('press', 104)">
+                        <div class="sensor-label">
+                            📊 Давление
+                            <span class="limits-indicator" id="press-indicator-104" style="display: none;">⚙️</span>
+                            <span id="press-forecast-104" class="forecast-badge"></span>
+                        </div>
+                        <div>
+                            <span class="sensor-value" id="press-value-104">--</span>
+                            <span class="sensor-unit">mmHg</span>
+                        </div>
+                        <div class="sensor-limits" id="press-limits-104"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Прогноз погоды -->
+            <div id="weather-forecast-104" class="weather-forecast">
+                🌤️ Прогноз: стабильно
             </div>
         </div>
 
@@ -672,7 +980,52 @@ void setup() {
             <div class="clearfix"></div>
             
             <div id="nodeSensorData105">
-                <p>Ожидание данных...</p>
+                <div class="sensor-grid">
+                    <!-- Температура -->
+                    <div class="sensor-item" id="sensor-temp-105" onclick="openLimitsModal('temp', 105)">
+                        <div class="sensor-label">
+                            🌡️ Температура
+                            <span class="limits-indicator" id="temp-indicator-105" style="display: none;">⚙️</span>
+                        </div>
+                        <div>
+                            <span class="sensor-value" id="temp-value-105">--</span>
+                            <span class="sensor-unit">°C</span>
+                        </div>
+                        <div class="sensor-limits" id="temp-limits-105"></div>
+                    </div>
+                    
+                    <!-- Влажность -->
+                    <div class="sensor-item" id="sensor-hum-105" onclick="openLimitsModal('hum', 105)">
+                        <div class="sensor-label">
+                            💧 Влажность
+                            <span class="limits-indicator" id="hum-indicator-105" style="display: none;">⚙️</span>
+                        </div>
+                        <div>
+                            <span class="sensor-value" id="hum-value-105">--</span>
+                            <span class="sensor-unit">%</span>
+                        </div>
+                        <div class="sensor-limits" id="hum-limits-105"></div>
+                    </div>
+                    
+                    <!-- Давление -->
+                    <div class="sensor-item" id="sensor-press-105" onclick="openLimitsModal('press', 105)">
+                        <div class="sensor-label">
+                            📊 Давление
+                            <span class="limits-indicator" id="press-indicator-105" style="display: none;">⚙️</span>
+                            <span id="press-forecast-105" class="forecast-badge"></span>
+                        </div>
+                        <div>
+                            <span class="sensor-value" id="press-value-105">--</span>
+                            <span class="sensor-unit">mmHg</span>
+                        </div>
+                        <div class="sensor-limits" id="press-limits-105"></div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Прогноз погоды -->
+            <div id="weather-forecast-105" class="weather-forecast">
+                🌤️ Прогноз: стабильно
             </div>
         </div>
 
@@ -733,6 +1086,40 @@ void setup() {
         </div>
     </div>
 
+    <!-- Модальное окно уставок -->
+    <div id="limitsModal" class="modal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeLimitsModal()">&times;</span>
+            <div class="modal-title" id="modal-title">Настройка уставок</div>
+            
+            <div class="limits-form">
+                <!-- МИНИМУМ -->
+                <div class="limit-row">
+                    <span class="limit-label">МИН</span>
+                    <input type="checkbox" id="min-enable" class="limit-checkbox">
+                    <input type="number" id="min-value" class="limit-input" step="0.1" value="0">
+                    <div class="limit-buttons">
+                        <button class="limit-btn" onclick="adjustMin(-1)">-1</button>
+                        <button class="limit-btn" onclick="adjustMin(1)">+1</button>
+                    </div>
+                </div>
+                
+                <!-- МАКСИМУМ -->
+                <div class="limit-row">
+                    <span class="limit-label">МАКС</span>
+                    <input type="checkbox" id="max-enable" class="limit-checkbox">
+                    <input type="number" id="max-value" class="limit-input" step="0.1" value="0">
+                    <div class="limit-buttons">
+                        <button class="limit-btn" onclick="adjustMax(-1)">-1</button>
+                        <button class="limit-btn" onclick="adjustMax(1)">+1</button>
+                    </div>
+                </div>
+                
+                <button class="save-btn" onclick="saveLimits()">💾 СОХРАНИТЬ</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Модальное окно "О системе" -->
     <div id="aboutModal" class="about-modal" onclick="hideAboutModal()">
         <div class="about-modal-content" onclick="event.stopPropagation()">
@@ -742,7 +1129,7 @@ void setup() {
             <div class="about-version">
                 <div class="about-version-item">
                     <span class="about-device">Хаб (ESP32)</span>
-                    <span class="about-ver" id="hubVersion">5.5</span>
+                    <span class="about-ver" id="hubVersion">5.7</span>
                 </div>
                 <div class="about-version-item">
                     <span class="about-device">Узел #102 (с энкодером)</span>
@@ -776,9 +1163,12 @@ void setup() {
                     <li>Управление LED (GPIO8) с веб-интерфейса</li>
                     <li>Ветер: отображение направления, размаха, желтый сектор 30 сек, штиль/шторм</li>
                     <li>Автоопределение потери связи (70 сек)</li>
-                    <li>Глобальная тревога при срабатывании любого узла</li>
+                    <li>Уставки для всех датчиков с настройкой мин/макс</li>
+                    <li>Прогноз погоды по давлению (Zambretti алгоритм)</li>
+                    <li>Детекция дождя по влажности</li>
+                    <li>Предупреждение о смене ветра</li>
                 </ul>
-                <strong>Версия хаба:</strong> 5.5<br>
+                <strong>Версия хаба:</strong> 5.7<br>
                 <strong>Версия узлов:</strong> 2.1<br>
                 <strong>Дата сборки:</strong> 2024
             </div>
@@ -792,7 +1182,12 @@ void setup() {
         let audioContext = null;
         let alarmInterval = null;
         let isAlarmPlaying = false;
-        let alarmTimer = null;
+
+        // Текущий выбранный датчик для модального окна
+        let currentSensor = {
+            nodeId: 102,
+            type: 'temp'
+        };
 
         function initAudio() {
             if (!audioContext) {
@@ -822,16 +1217,14 @@ void setup() {
                 playPulse(800, 0.1);
                 setTimeout(() => playPulse(1200, 0.1), 150);
             }, 500);
-            
-            alarmTimer = setTimeout(stopAlarm, 10000);
         }
 
         function stopAlarm() {
             isAlarmPlaying = false;
-            if (alarmInterval) clearInterval(alarmInterval);
-            if (alarmTimer) clearTimeout(alarmTimer);
-            alarmInterval = null;
-            alarmTimer = null;
+            if (alarmInterval) {
+                clearInterval(alarmInterval);
+                alarmInterval = null;
+            }
         }
 
         function playShortBeep() {
@@ -850,6 +1243,57 @@ void setup() {
             }
             beep(600, 0.2);
             setTimeout(() => beep(400, 0.3), 300);
+        }
+
+        // Звуки для разных событий
+        function playPressureDropSound() {
+            if (!audioContext) return;
+            function play(freq, dur) {
+                let osc = audioContext.createOscillator();
+                let gain = audioContext.createGain();
+                osc.connect(gain);
+                gain.connect(audioContext.destination);
+                osc.frequency.value = freq;
+                osc.type = 'sine';
+                gain.gain.value = 0.1;
+                osc.start();
+                gain.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + dur);
+                osc.stop(audioContext.currentTime + dur);
+            }
+            play(400, 0.3);
+            setTimeout(() => play(300, 0.5), 400);
+        }
+
+        function playRainSound() {
+            if (!audioContext) return;
+            for (let i = 0; i < 5; i++) {
+                setTimeout(() => {
+                    let osc = audioContext.createOscillator();
+                    let gain = audioContext.createGain();
+                    osc.connect(gain);
+                    gain.connect(audioContext.destination);
+                    osc.frequency.value = 800 + Math.random() * 400;
+                    osc.type = 'white';
+                    gain.gain.value = 0.05;
+                    osc.start();
+                    gain.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.1);
+                    osc.stop(audioContext.currentTime + 0.1);
+                }, i * 150);
+            }
+        }
+
+        function playWindChangeSound() {
+            if (!audioContext) return;
+            let osc = audioContext.createOscillator();
+            let gain = audioContext.createGain();
+            osc.connect(gain);
+            gain.connect(audioContext.destination);
+            osc.frequency.value = 600;
+            osc.type = 'sawtooth';
+            gain.gain.value = 0.1;
+            osc.start();
+            gain.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+            osc.stop(audioContext.currentTime + 0.5);
         }
 
         function showAboutModal() {
@@ -919,26 +1363,18 @@ void setup() {
         }
 
         function refreshAllData() {
-            for (let id of [102, 103, 104, 105]) {
-                document.getElementById('nodeSensorData' + id).innerHTML = 
-                    '<p style="color:#e74c3c;">⏳ Запрос данных отправлен...</p>';
-            }
             ws.send(JSON.stringify({command: 'GET_STATUS'}));
         }
 
         function markNodeDataAsStale(nodeId) {
             let items = document.querySelectorAll('#nodeSensorData' + nodeId + ' .sensor-item');
             items.forEach(i => i.classList.add('stale-data'));
-            let vals = document.querySelectorAll('#nodeSensorData' + nodeId + ' .sensor-value');
-            vals.forEach(v => v.classList.add('stale-data'));
             playShortBeep();
         }
 
         function markNodeDataAsFresh(nodeId) {
             let items = document.querySelectorAll('#nodeSensorData' + nodeId + ' .sensor-item');
             items.forEach(i => i.classList.remove('stale-data'));
-            let vals = document.querySelectorAll('#nodeSensorData' + nodeId + ' .sensor-value');
-            vals.forEach(v => v.classList.remove('stale-data'));
         }
 
         function updateSecurityStatus(nodeId, alarm, c1, c2) {
@@ -950,30 +1386,70 @@ void setup() {
                 else if (c1) txt += 'Концевик 1 разорван';
                 else if (c2) txt += 'Концевик 2 разорван';
                 el.innerHTML = txt;
+                playAlarmTone();
             } else {
                 el.className = 'security-status security-normal';
                 el.innerHTML = '🔒 ОХРАНА: НОРМА';
-            }
-        }
-
-        // ДОБАВЛЕНО: функция для отображения глобальной тревоги
-        function showGlobalAlarm(active) {
-            let banner = document.getElementById('globalAlarmBanner');
-            if (active) {
-                banner.style.display = 'block';
-                playAlarmTone(); // Звук для глобальной тревоги
-            } else {
-                banner.style.display = 'none';
-                // Останавливаем звук только если нет других тревог
                 let anyAlarm = false;
                 for (let id of [102, 103, 104, 105]) {
-                    if (document.getElementById('securityStatus' + id).className.includes('security-alarm')) {
+                    let statusEl = document.getElementById('securityStatus' + id);
+                    if (statusEl && statusEl.className.includes('security-alarm')) {
                         anyAlarm = true;
                         break;
                     }
                 }
                 if (!anyAlarm) stopAlarm();
             }
+        }
+
+        // Функции для модального окна уставок
+        function openLimitsModal(type, nodeId = 102) {
+            currentSensor.nodeId = nodeId;
+            currentSensor.type = type;
+            
+            let suffix = nodeId + '-' + type;
+            // Здесь должны быть загружены текущие уставки из данных
+            // В реальном коде они придут с хаба
+            
+            let sensorNames = { temp: 'Температура', hum: 'Влажность', press: 'Давление' };
+            document.getElementById('modal-title').innerHTML = 
+                `Узел #${nodeId} — ${sensorNames[type]}`;
+            
+            document.getElementById('limitsModal').style.display = 'flex';
+        }
+
+        function closeLimitsModal() {
+            document.getElementById('limitsModal').style.display = 'none';
+        }
+
+        function adjustMin(delta) {
+            let input = document.getElementById('min-value');
+            let val = parseFloat(input.value) + delta;
+            input.value = val.toFixed(1);
+        }
+
+        function adjustMax(delta) {
+            let input = document.getElementById('max-value');
+            let val = parseFloat(input.value) + delta;
+            input.value = val.toFixed(1);
+        }
+
+        function saveLimits() {
+            // Отправляем уставки на хаб
+            ws.send(JSON.stringify({
+                type: 'set_limits',
+                node: currentSensor.nodeId,
+                sensor: currentSensor.type,
+                min: {
+                    enabled: document.getElementById('min-enable').checked,
+                    value: parseFloat(document.getElementById('min-value').value)
+                },
+                max: {
+                    enabled: document.getElementById('max-enable').checked,
+                    value: parseFloat(document.getElementById('max-value').value)
+                }
+            }));
+            closeLimitsModal();
         }
 
         function drawSector(pathId, start, end) {
@@ -1018,23 +1494,18 @@ void setup() {
             }
             else if (msg.type === 'sensor_data') {
                 let nodeId = msg.node;
-                let html = '<div class="sensor-grid">';
-                if (msg.aht20) {
-                    html += `<div class="sensor-item"><span class="sensor-label">AHT20:</span><span class="sensor-value">${msg.aht20.temp}</span><span class="sensor-unit">°C</span></div>`;
-                    html += `<div class="sensor-item"><span class="sensor-label">AHT20:</span><span class="sensor-value">${msg.aht20.hum}</span><span class="sensor-unit">%</span></div>`;
+                if (msg.temp !== undefined) {
+                    document.getElementById('temp-value-' + nodeId).textContent = msg.temp.toFixed(1);
                 }
-                if (msg.bmp280) {
-                    html += `<div class="sensor-item"><span class="sensor-label">BMP280:</span><span class="sensor-value">${msg.bmp280.temp}</span><span class="sensor-unit">°C</span></div>`;
-                    html += `<div class="sensor-item"><span class="sensor-label">BMP280:</span><span class="sensor-value">${msg.bmp280.press}</span><span class="sensor-unit">mmHg</span></div>`;
+                if (msg.hum !== undefined) {
+                    document.getElementById('hum-value-' + nodeId).textContent = msg.hum.toFixed(1);
                 }
-                html += '</div>';
-                document.getElementById('nodeSensorData' + nodeId).innerHTML = html;
+                if (msg.press !== undefined) {
+                    document.getElementById('press-value-' + nodeId).textContent = msg.press.toFixed(1);
+                }
             }
             else if (msg.type === 'security') {
                 updateSecurityStatus(msg.node, msg.alarm, msg.contact1, msg.contact2);
-            }
-            else if (msg.type === 'global_alarm') {  // ДОБАВЛЕНО
-                showGlobalAlarm(msg.state);
             }
             else if (msg.type === 'connection_lost') {
                 markNodeDataAsStale(msg.node);
@@ -1076,48 +1547,117 @@ void setup() {
                 
                 let magnet = document.getElementById('magnetIndicator');
                 let magnetText = document.getElementById('magnetText');
-                if (msg.magnet) {
-                    magnet.style.backgroundColor = '#27ae60';
-                    magnetText.textContent = 'магнит есть';
-                    magnetText.style.color = '#27ae60';
-                } else {
-                    magnet.style.backgroundColor = '#e74c3c';
-                    magnetText.textContent = 'магнит нет';
-                    magnetText.style.color = '#e74c3c';
-                }
-                
-                let stability = msg.stability;
                 let badge = document.getElementById('stabilityBadge');
                 let badgeLarge = document.getElementById('stabilityBadgeLarge');
-                let text = '', color = '';
                 
-                switch(stability) {
-                    case 'calm':   text = 'ШТИЛЬ';    color = '#3498db'; break;
-                    case 'gusty':  text = 'ПОРЫВИСТЫЙ'; color = '#e67e22'; break;
-                    case 'strong': text = 'СИЛЬНЫЙ';   color = '#e74c3c'; break;
-                    case 'storm':  text = 'ШТОРМ';     color = '#8e44ad'; break;
-                    default:       text = 'ШТИЛЬ';    color = '#3498db';
-                }
-                
-                badge.textContent = text;
-                badge.style.backgroundColor = color;
-                if (badgeLarge) {
-                    badgeLarge.textContent = text;
-                    badgeLarge.style.backgroundColor = color;
-                }
-                
-                if (msg.sector_start !== undefined && msg.sector_end !== undefined) {
-                    drawSector('windSector', parseFloat(msg.sector_start), parseFloat(msg.sector_end));
-                    drawSector('windSectorLarge', parseFloat(msg.sector_start), parseFloat(msg.sector_end));
-                }
-                
-                if (msg.history_min !== undefined && msg.history_max !== undefined) {
-                    drawSector('windSectorMax', parseFloat(msg.history_min), parseFloat(msg.history_max));
-                    drawSector('windSectorMaxLarge', parseFloat(msg.history_min), parseFloat(msg.history_max));
+                if (msg.stability === 'no_signal') {
+                    magnet.style.backgroundColor = '#ffa500';
+                    magnetText.textContent = 'нет сигнала';
+                    magnetText.style.color = '#ffa500';
+                    badge.textContent = 'НЕТ СИГНАЛА';
+                    badge.className = 'wind-badge warning';
+                    if (badgeLarge) {
+                        badgeLarge.textContent = 'НЕТ СИГНАЛА';
+                        badgeLarge.className = 'wind-badge warning';
+                    }
+                    drawSector('windSector', 0, 360);
+                    drawSector('windSectorLarge', 0, 360);
+                } else if (msg.stability === 'no_magnet') {
+                    magnet.style.backgroundColor = '#ffa500';
+                    magnetText.textContent = 'магнит?';
+                    magnetText.style.color = '#ffa500';
+                    badge.textContent = 'МАГНИТ?';
+                    badge.className = 'wind-badge warning';
+                    if (badgeLarge) {
+                        badgeLarge.textContent = 'МАГНИТ?';
+                        badgeLarge.className = 'wind-badge warning';
+                    }
+                    drawSector('windSector', 0, 360);
+                    drawSector('windSectorLarge', 0, 360);
+                } else {
+                    if (msg.magnet) {
+                        magnet.style.backgroundColor = '#27ae60';
+                        magnetText.textContent = 'магнит есть';
+                        magnetText.style.color = '#27ae60';
+                    } else {
+                        magnet.style.backgroundColor = '#e74c3c';
+                        magnetText.textContent = 'магнит нет';
+                        magnetText.style.color = '#e74c3c';
+                    }
+                    
+                    let stability = msg.stability;
+                    let text = '', color = '';
+                    
+                    switch(stability) {
+                        case 'calm':   text = 'ШТИЛЬ';    color = '#3498db'; break;
+                        case 'gusty':  text = 'ПОРЫВИСТЫЙ'; color = '#e67e22'; break;
+                        case 'strong': text = 'СИЛЬНЫЙ';   color = '#e74c3c'; break;
+                        case 'storm':  text = 'ШТОРМ';     color = '#8e44ad'; break;
+                        default:       text = 'ШТИЛЬ';    color = '#3498db';
+                    }
+                    
+                    badge.textContent = text;
+                    badge.style.backgroundColor = color;
+                    badge.className = 'wind-badge';
+                    if (badgeLarge) {
+                        badgeLarge.textContent = text;
+                        badgeLarge.style.backgroundColor = color;
+                        badgeLarge.className = 'wind-badge';
+                    }
+                    
+                    if (msg.sector_start !== undefined && msg.sector_end !== undefined) {
+                        drawSector('windSector', parseFloat(msg.sector_start), parseFloat(msg.sector_end));
+                        drawSector('windSectorLarge', parseFloat(msg.sector_start), parseFloat(msg.sector_end));
+                    }
+                    
+                    if (msg.history_min !== undefined && msg.history_max !== undefined) {
+                        drawSector('windSectorMax', parseFloat(msg.history_min), parseFloat(msg.history_max));
+                        drawSector('windSectorMaxLarge', parseFloat(msg.history_min), parseFloat(msg.history_max));
+                    }
                 }
                 
                 rotateArrow('windArrow', parseFloat(msg.angle_avg));
                 rotateArrow('windArrowLarge', parseFloat(msg.angle_avg));
+            }
+            else if (msg.type === 'limits_update') {
+                // Обновление отображения уставок
+                let suffix = msg.node + '-' + msg.sensor;
+                let indicator = document.getElementById(msg.sensor + '-indicator-' + msg.node);
+                
+                if (msg.min.enabled || msg.max.enabled) {
+                    indicator.style.display = 'inline-block';
+                    
+                    let limitsText = '';
+                    if (msg.min.enabled) limitsText += `↓${msg.min.value.toFixed(1)}`;
+                    if (msg.max.enabled) {
+                        if (msg.min.enabled) limitsText += ' ';
+                        limitsText += `↑${msg.max.value.toFixed(1)}`;
+                    }
+                    document.getElementById(msg.sensor + '-limits-' + msg.node).innerHTML = limitsText;
+                    document.getElementById(msg.sensor + '-limits-' + msg.node).className = 'sensor-limits active';
+                } else {
+                    indicator.style.display = 'none';
+                    document.getElementById(msg.sensor + '-limits-' + msg.node).innerHTML = '';
+                    document.getElementById(msg.sensor + '-limits-' + msg.node).className = 'sensor-limits';
+                }
+            }
+            else if (msg.type === 'weather_forecast') {
+                let forecastEl = document.getElementById('weather-forecast-' + msg.node);
+                forecastEl.className = 'weather-forecast ' + msg.forecast_class;
+                forecastEl.innerHTML = msg.forecast_text;
+                
+                let badge = document.getElementById('press-forecast-' + msg.node);
+                badge.className = 'forecast-badge forecast-' + msg.trend;
+                badge.textContent = msg.trend === 'rain' ? '🌧️' : (msg.trend === 'sun' ? '☀️' : '☁️');
+            }
+            else if (msg.type === 'weather_alarm') {
+                if (msg.alarm_type === 'pressure_drop') {
+                    playPressureDropSound();
+                } else if (msg.alarm_type === 'rain') {
+                    playRainSound();
+                } else if (msg.alarm_type === 'wind_change') {
+                    playWindChangeSound();
+                }
             }
         };
 
@@ -1139,18 +1679,68 @@ void setup() {
             updateLEDButton(id);
         }
 
-        // Закрытие модального окна по ESC
+        // Закрытие модальных окон по ESC
         document.addEventListener('keydown', function(e) {
             if (e.key === 'Escape') {
                 hideAboutModal();
                 document.getElementById('windModal').style.display = 'none';
+                closeLimitsModal();
             }
         });
+
+        // Закрытие по клику вне окна
+        window.onclick = function(event) {
+            let modal = document.getElementById('limitsModal');
+            if (event.target === modal) {
+                closeLimitsModal();
+            }
+        };
     </script>
 </body>
 </html>
         )rawliteral";
         request->send(200, "text/html", html);
+    });
+
+    // API для получения уставок
+    server.on("/api/limits", HTTP_GET, [](AsyncWebServerRequest *request) {
+        int nodeId = request->arg("node").toInt();
+        String sensor = request->arg("sensor");
+        
+        int nodeIdx = -1;
+        for (int i = 0; i < NODE_COUNT; i++) {
+            if (nodeNumbers[i] == nodeId) {
+                nodeIdx = i;
+                break;
+            }
+        }
+        
+        if (nodeIdx == -1) {
+            request->send(404, "application/json", "{\"error\":\"Node not found\"}");
+            return;
+        }
+        
+        StaticJsonDocument<200> doc;
+        if (sensor == "temp") {
+            doc["min"]["enabled"] = nodeLimits[nodeIdx].temp_min.enabled;
+            doc["min"]["value"] = nodeLimits[nodeIdx].temp_min.value;
+            doc["max"]["enabled"] = nodeLimits[nodeIdx].temp_max.enabled;
+            doc["max"]["value"] = nodeLimits[nodeIdx].temp_max.value;
+        } else if (sensor == "hum") {
+            doc["min"]["enabled"] = nodeLimits[nodeIdx].hum_min.enabled;
+            doc["min"]["value"] = nodeLimits[nodeIdx].hum_min.value;
+            doc["max"]["enabled"] = nodeLimits[nodeIdx].hum_max.enabled;
+            doc["max"]["value"] = nodeLimits[nodeIdx].hum_max.value;
+        } else if (sensor == "press") {
+            doc["min"]["enabled"] = nodeLimits[nodeIdx].press_min.enabled;
+            doc["min"]["value"] = nodeLimits[nodeIdx].press_min.value;
+            doc["max"]["enabled"] = nodeLimits[nodeIdx].press_max.enabled;
+            doc["max"]["value"] = nodeLimits[nodeIdx].press_max.value;
+        }
+        
+        String response;
+        serializeJson(doc, response);
+        request->send(200, "application/json", response);
     });
 
     ws.onEvent(onWebSocketEvent);
@@ -1194,9 +1784,9 @@ void setup() {
     Serial.println("\n=== ХАБ ГОТОВ К РАБОТЕ ===");
     Serial.println("1. Подключитесь к Wi-Fi: " + String(AP_SSID));
     Serial.println("2. Откройте: http://" + WiFi.softAPIP().toString());
-    Serial.println("3. Ветер: желтый сектор 30 сек, штиль/шторм РАБОТАЕТ");
+    Serial.println("3. Версия хаба: 5.7 (уставки + прогноз)");
     Serial.println("4. Поддерживается 4 узла (ID 102, 103, 104, 105)");
-    Serial.println("5. Версия хаба: 5.5 (глобальная тревога), версия узлов: 2.1\n");
+    Serial.println("5. Уставки сохраняются в памяти\n");
 }
 
 void loop() {
@@ -1233,12 +1823,14 @@ void checkNodeConnection() {
                     connectionLostTime[i] = now;
                     Serial.printf("⚠️ СВЯЗЬ С УЗЛОМ #%d ПОТЕРЯНА!\n", nodeNumbers[i]);
                     sendConnectionStatusToWeb(i, false);
+                    checkGlobalAlarm();
                 }
             } else {
                 if (nodeConnectionLost[i]) {
                     nodeConnectionLost[i] = false;
                     Serial.printf("✅ СВЯЗЬ С УЗЛОМ #%d ВОССТАНОВЛЕНА!\n", nodeNumbers[i]);
                     sendConnectionStatusToWeb(i, true);
+                    checkGlobalAlarm();
                 }
             }
         }
@@ -1248,18 +1840,22 @@ void checkNodeConnection() {
 void updateAlarmState() {
     if (securityAlarmActive && (millis() - alarmStartTime) > ALARM_DURATION_MS) {
         securityAlarmActive = false;
-        checkGlobalAlarm(); // ДОБАВЛЕНО
+        checkGlobalAlarm();
     }
 }
 
-// ДОБАВЛЕНО: функция проверки глобальной тревоги
 void checkGlobalAlarm() {
     bool newGlobalAlarm = false;
     for (int i = 0; i < NODE_COUNT; i++) {
-        if (nodeAlarmState[i]) {
+        if (nodeAlarmState[i] || nodeConnectionLost[i]) {
             newGlobalAlarm = true;
             break;
         }
+    }
+    
+    // Проверка потери сигнала энкодера
+    if (lastEncoderDataTime > 0 && (millis() - lastEncoderDataTime) > ENCODER_TIMEOUT_MS) {
+        newGlobalAlarm = true;
     }
     
     if (newGlobalAlarm != globalAlarmActive) {
@@ -1269,46 +1865,81 @@ void checkGlobalAlarm() {
         } else {
             Serial.println("✅ Глобальная тревога снята");
         }
-        
-        // Отправляем статус в WebSocket
-        StaticJsonDocument<100> doc;
-        doc["type"] = "global_alarm";
-        doc["state"] = globalAlarmActive;
-        String json;
-        serializeJson(doc, json);
-        ws.textAll(json);
     }
 }
 
 void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                      AwsEventType type, void *arg, uint8_t *data, size_t len) {
-    if (type == WS_EVT_CONNECT) {
-        // Отправляем текущий статус глобальной тревоги новому клиенту
-        StaticJsonDocument<100> doc;
-        doc["type"] = "global_alarm";
-        doc["state"] = globalAlarmActive;
-        String json;
-        serializeJson(doc, json);
-        client->text(json);
-    }
-    else if (type == WS_EVT_DATA) {
-        StaticJsonDocument<200> doc;
-        if (!deserializeJson(doc, data, len) && doc.containsKey("command")) {
-            String cmd = doc["command"].as<String>();
-            int targetNode = doc["node"] | 102; // По умолчанию узел #102
-            
-            // Определяем MAC по номеру узла
-            uint8_t* targetMac = nullptr;
-            switch(targetNode) {
-                case 102: targetMac = node102MacAddress; break;
-                case 103: targetMac = node103MacAddress; break;
-                case 104: targetMac = node104MacAddress; break;
-                case 105: targetMac = node105MacAddress; break;
-                default: targetMac = node102MacAddress;
+    if (type == WS_EVT_DATA) {
+        StaticJsonDocument<256> doc;
+        if (!deserializeJson(doc, data, len)) {
+            if (doc.containsKey("command")) {
+                String cmd = doc["command"].as<String>();
+                int targetNode = doc["node"] | 102;
+                
+                uint8_t* targetMac = nullptr;
+                switch(targetNode) {
+                    case 102: targetMac = node102MacAddress; break;
+                    case 103: targetMac = node103MacAddress; break;
+                    case 104: targetMac = node104MacAddress; break;
+                    case 105: targetMac = node105MacAddress; break;
+                    default: targetMac = node102MacAddress;
+                }
+                
+                if (targetMac) {
+                    sendToNode(targetMac, cmd);
+                }
             }
-            
-            if (targetMac) {
-                sendToNode(targetMac, cmd);
+            else if (doc.containsKey("type") && doc["type"] == "set_limits") {
+                // Обработка установки уставок
+                int nodeId = doc["node"];
+                String sensor = doc["sensor"];
+                bool min_enabled = doc["min"]["enabled"];
+                float min_value = doc["min"]["value"];
+                bool max_enabled = doc["max"]["enabled"];
+                float max_value = doc["max"]["value"];
+                
+                int nodeIdx = -1;
+                for (int i = 0; i < NODE_COUNT; i++) {
+                    if (nodeNumbers[i] == nodeId) {
+                        nodeIdx = i;
+                        break;
+                    }
+                }
+                
+                if (nodeIdx != -1) {
+                    if (sensor == "temp") {
+                        nodeLimits[nodeIdx].temp_min.enabled = min_enabled;
+                        nodeLimits[nodeIdx].temp_min.value = min_value;
+                        nodeLimits[nodeIdx].temp_max.enabled = max_enabled;
+                        nodeLimits[nodeIdx].temp_max.value = max_value;
+                    } else if (sensor == "hum") {
+                        nodeLimits[nodeIdx].hum_min.enabled = min_enabled;
+                        nodeLimits[nodeIdx].hum_min.value = min_value;
+                        nodeLimits[nodeIdx].hum_max.enabled = max_enabled;
+                        nodeLimits[nodeIdx].hum_max.value = max_value;
+                    } else if (sensor == "press") {
+                        nodeLimits[nodeIdx].press_min.enabled = min_enabled;
+                        nodeLimits[nodeIdx].press_min.value = min_value;
+                        nodeLimits[nodeIdx].press_max.enabled = max_enabled;
+                        nodeLimits[nodeIdx].press_max.value = max_value;
+                    }
+                    
+                    saveLimitsToPrefs();
+                    
+                    // Отправляем подтверждение
+                    StaticJsonDocument<200> resp;
+                    resp["type"] = "limits_update";
+                    resp["node"] = nodeId;
+                    resp["sensor"] = sensor;
+                    resp["min"]["enabled"] = min_enabled;
+                    resp["min"]["value"] = min_value;
+                    resp["max"]["enabled"] = max_enabled;
+                    resp["max"]["value"] = max_value;
+                    String json;
+                    serializeJson(resp, json);
+                    ws.textAll(json);
+                }
             }
         }
     }
@@ -1351,7 +1982,7 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
     
     memcpy(&incomingMessage, data, len);
     
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<384> doc;
     DeserializationError error = deserializeJson(doc, incomingMessage.json);
     if (error) {
         Serial.print("❌ JSON ошибка: ");
@@ -1364,30 +1995,62 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
 
     if (strcmp(type, "sensor") == 0) {
         JsonObject dataObj = doc["data"];
+        
+        float temp = 0, hum = 0, press = 0;
+        
+        if (dataObj.containsKey("AHT20")) {
+            temp = dataObj["AHT20"]["temp"];
+            hum = dataObj["AHT20"]["hum"];
+        }
+        if (dataObj.containsKey("BMP280")) {
+            press = dataObj["BMP280"]["press_mmHg"];
+        }
+        
+        // Обновляем историю для прогнозов
+        updatePressureHistory(nodeIndex, press);
+        updateHumidityHistory(nodeIndex, hum);
+        
+        // Проверяем уставки
+        checkWeatherAlarms(nodeIndex);
+        
         StaticJsonDocument<300> resp;
         resp["type"] = "sensor_data";
         resp["node"] = nodeId;
-        if (dataObj.containsKey("AHT20")) {
-            resp["aht20"]["temp"] = dataObj["AHT20"]["temp"].as<String>();
-            resp["aht20"]["hum"] = dataObj["AHT20"]["hum"].as<String>();
-        }
-        if (dataObj.containsKey("BMP280")) {
-            resp["bmp280"]["temp"] = dataObj["BMP280"]["temp"].as<String>();
-            resp["bmp280"]["press"] = dataObj["BMP280"]["press_mmHg"].as<String>();
-        }
+        resp["temp"] = temp;
+        resp["hum"] = hum;
+        resp["press"] = press;
+        
         String json;
         serializeJson(resp, json);
         ws.textAll(json);
+        
+        // Отправляем прогноз
+        String forecast = getWeatherForecast(nodeIndex);
+        StaticJsonDocument<200> forecastResp;
+        forecastResp["type"] = "weather_forecast";
+        forecastResp["node"] = nodeId;
+        forecastResp["forecast_text"] = forecast;
+        if (forecast.indexOf("дождь") >= 0) {
+            forecastResp["forecast_class"] = "rain";
+            forecastResp["trend"] = "rain";
+        } else if (forecast.indexOf("ясно") >= 0) {
+            forecastResp["forecast_class"] = "sun";
+            forecastResp["trend"] = "sun";
+        } else {
+            forecastResp["forecast_class"] = "";
+            forecastResp["trend"] = "cloud";
+        }
+        String forecastJson;
+        serializeJson(forecastResp, forecastJson);
+        ws.textAll(forecastJson);
     }
     else if (strcmp(type, "security") == 0) {
         bool alarm = doc["alarm"];
         bool c1 = doc["contact1"];
         bool c2 = doc["contact2"];
         
-        // Сохраняем статус для глобальной тревоги (ДОБАВЛЕНО)
         nodeAlarmState[nodeIndex] = alarm;
         
-        // Локальная тревога для узла #102 (оставляем как есть)
         if (alarm && !securityAlarmActive && nodeId == 102) {
             securityAlarmActive = true;
             alarmStartTime = millis();
@@ -1396,7 +2059,6 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
             securityAlarmActive = false;
         }
         
-        // Проверяем глобальную тревогу (ДОБАВЛЕНО)
         checkGlobalAlarm();
         
         StaticJsonDocument<200> resp;
@@ -1444,14 +2106,14 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         ws.textAll(json);
     }
     else if (strcmp(type, "encoder") == 0) {
-        // Только для узла #102 (nodeIndex == 0)
         if (nodeIndex == 0) {
             float angle = doc["angle"];
             bool magnet = doc["magnet"];
             
+            processEncoderData(angle, magnet);
             if (magnet) {
-                processEncoderData(angle, true);
                 updateHistory(angle);
+                updateWindDirectionHistory(angle);
             }
         }
     }
@@ -1489,8 +2151,258 @@ String relayStateToString(uint32_t state) {
     return (state == 1) ? "ВКЛЮЧЕНО" : "ВЫКЛЮЧЕНО";
 }
 
+// ========== ЗАГРУЗКА И СОХРАНЕНИЕ УСТАВОК ==========
+void loadLimitsFromPrefs() {
+    for (int i = 0; i < NODE_COUNT; i++) {
+        String baseKey = "node" + String(nodeNumbers[i]);
+        
+        // Температура
+        nodeLimits[i].temp_min.enabled = prefs.getBool((baseKey + "_tmin_en").c_str(), false);
+        nodeLimits[i].temp_min.value = prefs.getFloat((baseKey + "_tmin_val").c_str(), 18.0);
+        nodeLimits[i].temp_max.enabled = prefs.getBool((baseKey + "_tmax_en").c_str(), false);
+        nodeLimits[i].temp_max.value = prefs.getFloat((baseKey + "_tmax_val").c_str(), 25.0);
+        
+        // Влажность
+        nodeLimits[i].hum_min.enabled = prefs.getBool((baseKey + "_hmin_en").c_str(), false);
+        nodeLimits[i].hum_min.value = prefs.getFloat((baseKey + "_hmin_val").c_str(), 30.0);
+        nodeLimits[i].hum_max.enabled = prefs.getBool((baseKey + "_hmax_en").c_str(), false);
+        nodeLimits[i].hum_max.value = prefs.getFloat((baseKey + "_hmax_val").c_str(), 70.0);
+        
+        // Давление
+        nodeLimits[i].press_min.enabled = prefs.getBool((baseKey + "_pmin_en").c_str(), false);
+        nodeLimits[i].press_min.value = prefs.getFloat((baseKey + "_pmin_val").c_str(), 730.0);
+        nodeLimits[i].press_max.enabled = prefs.getBool((baseKey + "_pmax_en").c_str(), false);
+        nodeLimits[i].press_max.value = prefs.getFloat((baseKey + "_pmax_val").c_str(), 770.0);
+        
+        // Ветер (для узла #102)
+        if (i == 0) {
+            nodeLimits[i].wind_storm.enabled = prefs.getBool((baseKey + "_wstorm_en").c_str(), false);
+            nodeLimits[i].wind_storm.value = prefs.getFloat((baseKey + "_wstorm_val").c_str(), 15.0);
+            nodeLimits[i].wind_change.enabled = prefs.getBool((baseKey + "_wchange_en").c_str(), false);
+            nodeLimits[i].wind_change.value = prefs.getFloat((baseKey + "_wchange_val").c_str(), 90.0);
+        }
+    }
+}
+
+void saveLimitsToPrefs() {
+    for (int i = 0; i < NODE_COUNT; i++) {
+        String baseKey = "node" + String(nodeNumbers[i]);
+        
+        // Температура
+        prefs.putBool((baseKey + "_tmin_en").c_str(), nodeLimits[i].temp_min.enabled);
+        prefs.putFloat((baseKey + "_tmin_val").c_str(), nodeLimits[i].temp_min.value);
+        prefs.putBool((baseKey + "_tmax_en").c_str(), nodeLimits[i].temp_max.enabled);
+        prefs.putFloat((baseKey + "_tmax_val").c_str(), nodeLimits[i].temp_max.value);
+        
+        // Влажность
+        prefs.putBool((baseKey + "_hmin_en").c_str(), nodeLimits[i].hum_min.enabled);
+        prefs.putFloat((baseKey + "_hmin_val").c_str(), nodeLimits[i].hum_min.value);
+        prefs.putBool((baseKey + "_hmax_en").c_str(), nodeLimits[i].hum_max.enabled);
+        prefs.putFloat((baseKey + "_hmax_val").c_str(), nodeLimits[i].hum_max.value);
+        
+        // Давление
+        prefs.putBool((baseKey + "_pmin_en").c_str(), nodeLimits[i].press_min.enabled);
+        prefs.putFloat((baseKey + "_pmin_val").c_str(), nodeLimits[i].press_min.value);
+        prefs.putBool((baseKey + "_pmax_en").c_str(), nodeLimits[i].press_max.enabled);
+        prefs.putFloat((baseKey + "_pmax_val").c_str(), nodeLimits[i].press_max.value);
+        
+        // Ветер (для узла #102)
+        if (i == 0) {
+            prefs.putBool((baseKey + "_wstorm_en").c_str(), nodeLimits[i].wind_storm.enabled);
+            prefs.putFloat((baseKey + "_wstorm_val").c_str(), nodeLimits[i].wind_storm.value);
+            prefs.putBool((baseKey + "_wchange_en").c_str(), nodeLimits[i].wind_change.enabled);
+            prefs.putFloat((baseKey + "_wchange_val").c_str(), nodeLimits[i].wind_change.value);
+        }
+    }
+    prefs.end();
+    prefs.begin("hub", false);
+}
+
+// ========== ПРОГНОЗ ПОГОДЫ ПО ДАВЛЕНИЮ (ZAMBRETTI) ==========
+void updatePressureHistory(int nodeIndex, float pressure) {
+    pressureHistory[nodeIndex][pressureIndex[nodeIndex]] = pressure;
+    pressureTimestamps[nodeIndex][pressureIndex[nodeIndex]] = millis();
+    pressureIndex[nodeIndex] = (pressureIndex[nodeIndex] + 1) % PRESSURE_HISTORY_SIZE;
+    if (pressureCount[nodeIndex] < PRESSURE_HISTORY_SIZE) {
+        pressureCount[nodeIndex]++;
+    }
+}
+
+String getWeatherForecast(int nodeIndex) {
+    if (pressureCount[nodeIndex] < 2) {
+        return "🌤️ Сбор данных...";
+    }
+    
+    // Находим самое старое значение за последние 3 часа
+    unsigned long now = millis();
+    float oldestPressure = -1;
+    float newestPressure = -1;
+    int validCount = 0;
+    
+    for (int i = 0; i < pressureCount[nodeIndex]; i++) {
+        if (now - pressureTimestamps[nodeIndex][i] <= 10800000) { // 3 часа
+            if (oldestPressure < 0) {
+                oldestPressure = pressureHistory[nodeIndex][i];
+            }
+            newestPressure = pressureHistory[nodeIndex][i];
+            validCount++;
+        }
+    }
+    
+    if (validCount < 2) {
+        return "🌤️ Стабильно";
+    }
+    
+    // Вычисляем тренд
+    float change = newestPressure - oldestPressure;
+    float changePerHour = change * 3600000.0 / (10800000.0); // мм рт.ст. в час
+    
+    // Zambretti алгоритм
+    if (changePerHour < -0.5) {
+        // Быстрое падение
+        if (newestPressure < 740) {
+            return "🌧️🚨 Шторм! Давление падает";
+        } else if (newestPressure < 750) {
+            return "🌧️ Дождь, давление падает";
+        } else {
+            return "☁️ Облачно, давление падает";
+        }
+    } else if (changePerHour > 0.5) {
+        // Быстрый рост
+        if (newestPressure > 760) {
+            return "☀️ Ясно, давление растет";
+        } else {
+            return "⛅ Переменно, давление растет";
+        }
+    } else {
+        // Стабильно
+        if (newestPressure > 760) {
+            return "☀️ Ясно, давление стабильно";
+        } else if (newestPressure < 740) {
+            return "🌧️ Пасмурно, давление низкое";
+        } else {
+            return "☁️ Облачно, давление стабильно";
+        }
+    }
+}
+
+// ========== ДЕТЕКЦИЯ ДОЖДЯ ПО ВЛАЖНОСТИ ==========
+void updateHumidityHistory(int nodeIndex, float humidity) {
+    humidityHistory[nodeIndex][humidityIndex[nodeIndex]] = humidity;
+    humidityTimestamps[nodeIndex][humidityIndex[nodeIndex]] = millis();
+    humidityIndex[nodeIndex] = (humidityIndex[nodeIndex] + 1) % HUMIDITY_HISTORY_SIZE;
+    if (humidityCount[nodeIndex] < HUMIDITY_HISTORY_SIZE) {
+        humidityCount[nodeIndex]++;
+    }
+}
+
+// ========== ИСТОРИЯ ВЕТРА ==========
+void updateWindDirectionHistory(float direction) {
+    windDirectionHistory[windDirectionIndex] = direction;
+    windDirectionTimestamps[windDirectionIndex] = millis();
+    windDirectionIndex = (windDirectionIndex + 1) % WIND_HISTORY_SIZE;
+    if (windDirectionCount < WIND_HISTORY_SIZE) {
+        windDirectionCount++;
+    }
+}
+
+// ========== ПРОВЕРКА ПОГОДНЫХ ТРЕВОГ ==========
+void checkWeatherAlarms(int nodeIndex) {
+    // Проверка резкого падения давления
+    if (pressureCount[nodeIndex] >= 2) {
+        unsigned long now = millis();
+        float oldestPressure = -1;
+        float newestPressure = -1;
+        
+        for (int i = 0; i < pressureCount[nodeIndex]; i++) {
+            if (now - pressureTimestamps[nodeIndex][i] <= 10800000) {
+                if (oldestPressure < 0) {
+                    oldestPressure = pressureHistory[nodeIndex][i];
+                }
+                newestPressure = pressureHistory[nodeIndex][i];
+            }
+        }
+        
+        if (oldestPressure > 0 && newestPressure > 0) {
+            float changePerHour = (newestPressure - oldestPressure) * 3600000.0 / 10800000.0;
+            
+            if (changePerHour < -1.0) {
+                // Резкое падение давления
+                StaticJsonDocument<100> alarm;
+                alarm["type"] = "weather_alarm";
+                alarm["alarm_type"] = "pressure_drop";
+                alarm["node"] = nodeNumbers[nodeIndex];
+                String json;
+                serializeJson(alarm, json);
+                ws.textAll(json);
+            }
+        }
+    }
+    
+    // Проверка дождя по влажности
+    if (humidityCount[nodeIndex] >= 2) {
+        unsigned long now = millis();
+        float oldestHum = -1;
+        float newestHum = -1;
+        
+        for (int i = 0; i < humidityCount[nodeIndex]; i++) {
+            if (now - humidityTimestamps[nodeIndex][i] <= 900000) { // 15 минут
+                if (oldestHum < 0) {
+                    oldestHum = humidityHistory[nodeIndex][i];
+                }
+                newestHum = humidityHistory[nodeIndex][i];
+            }
+        }
+        
+        if (oldestHum > 0 && newestHum > 0) {
+            float change = newestHum - oldestHum;
+            if (change > 15.0) {
+                // Резкий скачок влажности
+                StaticJsonDocument<100> alarm;
+                alarm["type"] = "weather_alarm";
+                alarm["alarm_type"] = "rain";
+                alarm["node"] = nodeNumbers[nodeIndex];
+                String json;
+                serializeJson(alarm, json);
+                ws.textAll(json);
+            }
+        }
+    }
+    
+    // Проверка смены ветра (только для узла #102)
+    if (nodeIndex == 0 && windDirectionCount >= 2) {
+        unsigned long now = millis();
+        float oldestDir = -1;
+        float newestDir = windDirection;
+        
+        for (int i = 0; i < windDirectionCount; i++) {
+            if (now - windDirectionTimestamps[i] <= 1800000) { // 30 минут
+                oldestDir = windDirectionHistory[i];
+                break;
+            }
+        }
+        
+        if (oldestDir >= 0) {
+            float diff = fabs(newestDir - oldestDir);
+            if (diff > 180) diff = 360 - diff;
+            
+            if (diff > 90) {
+                StaticJsonDocument<100> alarm;
+                alarm["type"] = "weather_alarm";
+                alarm["alarm_type"] = "wind_change";
+                alarm["node"] = nodeNumbers[nodeIndex];
+                String json;
+                serializeJson(alarm, json);
+                ws.textAll(json);
+            }
+        }
+    }
+}
+
 // ========== ВЕТЕР: ДВЕ ТОЧКИ + ЖЕЛТЫЙ СЕКТОР 30 СЕК + ШТИЛЬ/ШТОРМ ==========
 void processEncoderData(float angle, bool magnet) {
+    lastEncoderDataTime = millis();
+    
     if (prevEncoderAngle < 0) {
         prevEncoderAngle = angle;
         currentEncoderAngle = angle;
@@ -1511,12 +2423,10 @@ void processEncoderData(float angle, bool magnet) {
         
         float diff = fmod(currentEncoderAngle - prevEncoderAngle + 540.0, 360.0) - 180.0;
         windCurrentSector = fabs(diff);
-        
-        Serial.printf("🌪️ Ветер: prev=%.1f°, curr=%.1f°, напр=%.1f°, сектор=%.1f°\n", 
-                      prevEncoderAngle, currentEncoderAngle, windDirection, windCurrentSector);
     }
     
     windMagnet = magnet;
+    checkGlobalAlarm();
 }
 
 void updateHistory(float angle) {
@@ -1525,7 +2435,6 @@ void updateHistory(float angle) {
     historyIndex = (historyIndex + 1) % ENCODER_HISTORY_SIZE;
     if (historyCount < ENCODER_HISTORY_SIZE) {
         historyCount++;
-        Serial.printf("📝 История: добавлен %.1f°, всего записей: %d\n", angle, historyCount);
     }
 }
 
@@ -1538,7 +2447,7 @@ void updateMaxMin() {
     int validCount = 0;
     
     for (int i = 0; i < historyCount; i++) {
-        if (now - historyTimestamps[i] <= 30000) { // 30 секунд
+        if (now - historyTimestamps[i] <= 30000) {
             float a = encoderHistory[i];
             if (a < currentMin) currentMin = a;
             if (a > currentMax) currentMax = a;
@@ -1547,27 +2456,44 @@ void updateMaxMin() {
     }
     
     if (validCount > 0 && currentMax >= 0) {
-        maxAngle = currentMax;
-        minAngle = currentMin;
-        Serial.printf("📊 Желтый сектор: мин=%.1f°, макс=%.1f° (%d записей)\n", 
-                     minAngle, maxAngle, validCount);
+        if (currentMin < 60 && currentMax > 300) {
+            maxAngle = currentMax;
+            minAngle = currentMin;
+        } else {
+            maxAngle = currentMax;
+            minAngle = currentMin;
+        }
     }
 }
 
 void broadcastEncoderData() {
     if (prevEncoderAngle < 0) return;
     
-    float redStart = windDirection - windCurrentSector / 2;
-    float redEnd = windDirection + windCurrentSector / 2;
-    redStart = fmod(fmod(redStart, 360) + 360, 360);
-    redEnd = fmod(fmod(redEnd, 360) + 360, 360);
-    
-    // СТАБИЛЬНОСТЬ ПО ТЕКУЩЕМУ РАЗМАХУ
+    float redStart, redEnd;
     String stability;
-    if (windCurrentSector < 10) stability = "calm";
-    else if (windCurrentSector < 30) stability = "gusty";
-    else if (windCurrentSector < 60) stability = "strong";
-    else stability = "storm";
+    bool encoderTimeout = (millis() - lastEncoderDataTime) > ENCODER_TIMEOUT_MS;
+    
+    if (encoderTimeout) {
+        stability = "no_signal";
+        redStart = 0;
+        redEnd = 360;
+        Serial.println("⚠️ ТРЕВОГА: Нет сигнала от энкодера!");
+    } else if (!windMagnet) {
+        stability = "no_magnet";
+        redStart = 0;
+        redEnd = 360;
+        Serial.println("⚠️ ПРЕДУПРЕЖДЕНИЕ: Магнит не обнаружен");
+    } else {
+        redStart = windDirection - windCurrentSector / 2;
+        redEnd = windDirection + windCurrentSector / 2;
+        redStart = fmod(fmod(redStart, 360) + 360, 360);
+        redEnd = fmod(fmod(redEnd, 360) + 360, 360);
+        
+        if (windCurrentSector < 10) stability = "calm";
+        else if (windCurrentSector < 30) stability = "gusty";
+        else if (windCurrentSector < 60) stability = "strong";
+        else stability = "storm";
+    }
     
     StaticJsonDocument<256> doc;
     doc["type"] = "wind";
