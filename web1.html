@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Тест уставок датчиков</title>
+    <style>
+        body {
+            font-family: Arial;
+            background: #2c3e50;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+        .dashboard {
+            max-width: 800px;
+            width: 100%;
+        }
+        h1 {
+            color: white;
+            text-align: center;
+        }
+        
+        /* Карточка узла */
+        .section {
+            background: #f9f9f9;
+            border-radius: 10px;
+            padding: 16px;
+            margin: 20px 0;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .section-title {
+            font-size: 1.5em;
+            margin-bottom: 8px;
+            color: #2c3e50;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 6px;
+            font-weight: bold;
+        }
+        
+        /* Сетка датчиков */
+        .sensor-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-top: 10px;
+        }
+        
+        /* Поле датчика - кликабельное */
+        .sensor-item {
+            background: white;
+            padding: 12px;
+            border-radius: 8px;
+            border-left: 4px solid #3498db;
+            cursor: pointer;
+            transition: all 0.2s;
+            position: relative;
+            min-height: 70px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .sensor-item:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+        .sensor-item.alarm {
+            border-left: 4px solid #e74c3c;
+            background: #fff5f5;
+        }
+        
+        /* Основное значение */
+        .sensor-label {
+            font-weight: bold;
+            color: #555;
+            font-size: 0.85em;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .sensor-value {
+            font-size: 1.8em;
+            font-family: 'Courier New', monospace;
+            color: #2c3e50;
+            font-weight: bold;
+            line-height: 1.2;
+        }
+        .sensor-unit {
+            font-size: 0.8em;
+            color: #7f8c8d;
+            margin-left: 4px;
+        }
+        
+        /* Уставки мелким шрифтом */
+        .sensor-limits {
+            font-size: 0.7em;
+            color: #7f8c8d;
+            margin-top: 4px;
+            font-family: monospace;
+        }
+        .sensor-limits.active {
+            color: #e67e22;
+            font-weight: bold;
+        }
+        
+        /* Модальное окно уставок */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 10000;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-content {
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            max-width: 400px;
+            width: 90%;
+            position: relative;
+        }
+        .modal-close {
+            position: absolute;
+            top: 15px;
+            right: 20px;
+            font-size: 28px;
+            font-weight: bold;
+            color: #7f8c8d;
+            cursor: pointer;
+        }
+        .modal-close:hover {
+            color: #e74c3c;
+        }
+        .modal-title {
+            font-size: 20px;
+            color: #2c3e50;
+            margin-bottom: 20px;
+            text-align: center;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+        }
+        
+        /* Форма уставок */
+        .limits-form {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .limit-row {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 10px;
+            background: #f5f5f5;
+            border-radius: 8px;
+        }
+        .limit-label {
+            width: 60px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .limit-checkbox {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+        .limit-input {
+            width: 100px;
+            padding: 8px;
+            border: 2px solid #bdc3c7;
+            border-radius: 5px;
+            font-size: 16px;
+            text-align: center;
+        }
+        .limit-input:focus {
+            border-color: #3498db;
+            outline: none;
+        }
+        .limit-buttons {
+            display: flex;
+            gap: 5px;
+        }
+        .limit-btn {
+            width: 40px;
+            height: 40px;
+            border: none;
+            border-radius: 5px;
+            background: #3498db;
+            color: white;
+            font-size: 18px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .limit-btn:hover {
+            background: #2980b9;
+        }
+        .limit-btn:active {
+            transform: scale(0.95);
+        }
+        .save-btn {
+            background: #27ae60;
+            color: white;
+            border: none;
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        .save-btn:hover {
+            background: #2ecc71;
+        }
+        
+        /* Индикатор активных уставок */
+        .limits-indicator {
+            display: inline-block;
+            background: #e67e22;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            margin-left: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="dashboard">
+        <h1>🔧 Тест уставок датчиков</h1>
+        
+        <!-- Карточка узла #102 -->
+        <div class="section">
+            <div class="section-title">Узел #102 (Мастерская)</div>
+            
+            <div class="sensor-grid">
+                <!-- Температура -->
+                <div class="sensor-item" id="sensor-temp" onclick="openLimitsModal('temp')">
+                    <div class="sensor-label">
+                        🌡️ Температура
+                        <span class="limits-indicator" id="temp-indicator" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="temp-value">23.5</span>
+                        <span class="sensor-unit">°C</span>
+                    </div>
+                    <div class="sensor-limits" id="temp-limits"></div>
+                </div>
+                
+                <!-- Влажность -->
+                <div class="sensor-item" id="sensor-hum" onclick="openLimitsModal('hum')">
+                    <div class="sensor-label">
+                        💧 Влажность
+                        <span class="limits-indicator" id="hum-indicator" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="hum-value">45.2</span>
+                        <span class="sensor-unit">%</span>
+                    </div>
+                    <div class="sensor-limits" id="hum-limits"></div>
+                </div>
+                
+                <!-- Давление -->
+                <div class="sensor-item" id="sensor-press" onclick="openLimitsModal('press')">
+                    <div class="sensor-label">
+                        📊 Давление
+                        <span class="limits-indicator" id="press-indicator" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="press-value">745.3</span>
+                        <span class="sensor-unit">mmHg</span>
+                    </div>
+                    <div class="sensor-limits" id="press-limits"></div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Карточка узла #103 (копия для теста) -->
+        <div class="section">
+            <div class="section-title">Узел #103</div>
+            
+            <div class="sensor-grid">
+                <!-- Температура -->
+                <div class="sensor-item" id="sensor-temp-103" onclick="openLimitsModal('temp', 103)">
+                    <div class="sensor-label">
+                        🌡️ Температура
+                        <span class="limits-indicator" id="temp-indicator-103" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="temp-value-103">22.1</span>
+                        <span class="sensor-unit">°C</span>
+                    </div>
+                    <div class="sensor-limits" id="temp-limits-103"></div>
+                </div>
+                
+                <!-- Влажность -->
+                <div class="sensor-item" id="sensor-hum-103" onclick="openLimitsModal('hum', 103)">
+                    <div class="sensor-label">
+                        💧 Влажность
+                        <span class="limits-indicator" id="hum-indicator-103" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="hum-value-103">52.7</span>
+                        <span class="sensor-unit">%</span>
+                    </div>
+                    <div class="sensor-limits" id="hum-limits-103"></div>
+                </div>
+                
+                <!-- Давление -->
+                <div class="sensor-item" id="sensor-press-103" onclick="openLimitsModal('press', 103)">
+                    <div class="sensor-label">
+                        📊 Давление
+                        <span class="limits-indicator" id="press-indicator-103" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="press-value-103">751.8</span>
+                        <span class="sensor-unit">mmHg</span>
+                    </div>
+                    <div class="sensor-limits" id="press-limits-103"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Модальное окно уставок -->
+    <div id="limitsModal" class="modal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeLimitsModal()">&times;</span>
+            <div class="modal-title" id="modal-title">Настройка уставок</div>
+            
+            <div class="limits-form">
+                <!-- МИНИМУМ -->
+                <div class="limit-row">
+                    <span class="limit-label">МИН</span>
+                    <input type="checkbox" id="min-enable" class="limit-checkbox">
+                    <input type="number" id="min-value" class="limit-input" step="0.1" value="18.0">
+                    <div class="limit-buttons">
+                        <button class="limit-btn" onclick="adjustMin(-1)">-1</button>
+                        <button class="limit-btn" onclick="adjustMin(1)">+1</button>
+                    </div>
+                </div>
+                
+                <!-- МАКСИМУМ -->
+                <div class="limit-row">
+                    <span class="limit-label">МАКС</span>
+                    <input type="checkbox" id="max-enable" class="limit-checkbox">
+                    <input type="number" id="max-value" class="limit-input" step="0.1" value="25.0">
+                    <div class="limit-buttons">
+                        <button class="limit-btn" onclick="adjustMax(-1)">-1</button>
+                        <button class="limit-btn" onclick="adjustMax(1)">+1</button>
+                    </div>
+                </div>
+                
+                <button class="save-btn" onclick="saveLimits()">💾 СОХРАНИТЬ</button>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // Текущий выбранный датчик
+        let currentSensor = {
+            nodeId: 102,
+            type: 'temp'
+        };
+        
+        // Хранилище уставок (в реальном коде будет загружаться с хаба)
+        let limits = {
+            102: {
+                temp: { min: { enabled: true, value: 18.0 }, max: { enabled: true, value: 25.0 } },
+                hum: { min: { enabled: true, value: 30.0 }, max: { enabled: true, value: 70.0 } },
+                press: { min: { enabled: false, value: 730.0 }, max: { enabled: false, value: 770.0 } }
+            },
+            103: {
+                temp: { min: { enabled: false, value: 15.0 }, max: { enabled: false, value: 30.0 } },
+                hum: { min: { enabled: false, value: 20.0 }, max: { enabled: false, value: 80.0 } },
+                press: { min: { enabled: false, value: 720.0 }, max: { enabled: false, value: 780.0 } }
+            }
+        };
+        
+        // Функция открытия модального окна
+        function openLimitsModal(type, nodeId = 102) {
+            currentSensor.nodeId = nodeId;
+            currentSensor.type = type;
+            
+            // Загружаем текущие уставки
+            let lim = limits[nodeId][type];
+            
+            document.getElementById('min-enable').checked = lim.min.enabled;
+            document.getElementById('min-value').value = lim.min.value.toFixed(1);
+            document.getElementById('max-enable').checked = lim.max.enabled;
+            document.getElementById('max-value').value = lim.max.value.toFixed(1);
+            
+            // Обновляем заголовок
+            let sensorNames = { temp: 'Температура', hum: 'Влажность', press: 'Давление' };
+            document.getElementById('modal-title').innerHTML = 
+                `Узел #${nodeId} — ${sensorNames[type]}`;
+            
+            // Показываем окно
+            document.getElementById('limitsModal').style.display = 'flex';
+        }
+        
+        // Закрытие модального окна
+        function closeLimitsModal() {
+            document.getElementById('limitsModal').style.display = 'none';
+        }
+        
+        // Регулировка МИН
+        function adjustMin(delta) {
+            let input = document.getElementById('min-value');
+            let val = parseFloat(input.value) + delta;
+            input.value = val.toFixed(1);
+        }
+        
+        // Регулировка МАКС
+        function adjustMax(delta) {
+            let input = document.getElementById('max-value');
+            let val = parseFloat(input.value) + delta;
+            input.value = val.toFixed(1);
+        }
+        
+        // Сохранение уставок
+        function saveLimits() {
+            // Сохраняем значения
+            limits[currentSensor.nodeId][currentSensor.type] = {
+                min: {
+                    enabled: document.getElementById('min-enable').checked,
+                    value: parseFloat(document.getElementById('min-value').value)
+                },
+                max: {
+                    enabled: document.getElementById('max-enable').checked,
+                    value: parseFloat(document.getElementById('max-value').value)
+                }
+            };
+            
+            // Обновляем отображение
+            updateLimitsDisplay(currentSensor.nodeId, currentSensor.type);
+            
+            // Проверяем тревогу
+            checkAlarm(currentSensor.nodeId, currentSensor.type);
+            
+            // Закрываем окно
+            closeLimitsModal();
+        }
+        
+        // Обновление отображения уставок
+        function updateLimitsDisplay(nodeId, type) {
+            let lim = limits[nodeId][type];
+            let suffix = nodeId === 102 ? '' : '-103';
+            
+            // Формируем строку уставок
+            let limitsText = '';
+            let indicator = document.getElementById(type + '-indicator' + suffix);
+            
+            if (lim.min.enabled || lim.max.enabled) {
+                if (lim.min.enabled) limitsText += `↓${lim.min.value.toFixed(1)}`;
+                if (lim.max.enabled) {
+                    if (lim.min.enabled) limitsText += ' ';
+                    limitsText += `↑${lim.max.value.toFixed(1)}`;
+                }
+                indicator.style.display = 'inline-block';
+            } else {
+                indicator.style.display = 'none';
+            }
+            
+            document.getElementById(type + '-limits' + suffix).innerHTML = limitsText;
+            document.getElementById(type + '-limits' + suffix).className = 
+                'sensor-limits' + (lim.min.enabled || lim.max.enabled ? ' active' : '');
+        }
+        
+        // Проверка тревоги по уставкам
+        function checkAlarm(nodeId, type) {
+            let lim = limits[nodeId][type];
+            let suffix = nodeId === 102 ? '' : '-103';
+            
+            // Получаем текущее значение датчика
+            let valueEl = document.getElementById(type + '-value' + suffix);
+            if (!valueEl) return;
+            
+            let value = parseFloat(valueEl.textContent);
+            let sensorEl = document.getElementById('sensor-' + type + suffix);
+            
+            let alarm = false;
+            
+            if (lim.min.enabled && value < lim.min.value) alarm = true;
+            if (lim.max.enabled && value > lim.max.value) alarm = true;
+            
+            if (alarm) {
+                sensorEl.classList.add('alarm');
+                // Здесь можно вызвать общую тревогу
+                console.log(`🚨 ТРЕВОГА: Узел #${nodeId} ${type} = ${value}`);
+            } else {
+                sensorEl.classList.remove('alarm');
+            }
+        }
+        
+        // Инициализация при загрузке
+        window.onload = function() {
+            // Обновляем отображение для всех датчиков
+            updateLimitsDisplay(102, 'temp');
+            updateLimitsDisplay(102, 'hum');
+            updateLimitsDisplay(102, 'press');
+            updateLimitsDisplay(103, 'temp');
+            updateLimitsDisplay(103, 'hum');
+            updateLimitsDisplay(103, 'press');
+            
+            // Проверяем тревоги
+            checkAlarm(102, 'temp');
+            checkAlarm(102, 'hum');
+            checkAlarm(102, 'press');
+            checkAlarm(103, 'temp');
+            checkAlarm(103, 'hum');
+            checkAlarm(103, 'press');
+        };
+        
+        // Закрытие по ESC
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                closeLimitsModal();
+            }
+        });
+        
+        // Закрытие по клику вне окна
+        window.onclick = function(event) {
+            let modal = document.getElementById('limitsModal');
+            if (event.target === modal) {
+                closeLimitsModal();
+            }
+        };
+    </script>
+</body>
+</html>
