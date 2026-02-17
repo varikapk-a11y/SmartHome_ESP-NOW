@@ -1,0 +1,1310 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Умный дом ESP-NOW</title>
+    <style>
+        body {
+            font-family: Arial;
+            background: #2c3e50;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+        .dashboard {
+            max-width: 800px;
+            width: 100%;
+        }
+        h1 {
+            color: white;
+            text-align: center;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+        #refreshBtn {
+            font-size: 14px;
+            padding: 10px 25px;
+            background: #3498db;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            margin: 20px auto;
+            display: block;
+            width: 250px;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+        #refreshBtn:hover {
+            background: #2980b9;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        #aboutBtn {
+            font-size: 14px;
+            padding: 10px 25px;
+            background: #34495e;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            margin: 10px auto 30px;
+            display: block;
+            width: 250px;
+            font-weight: bold;
+            transition: all 0.3s;
+        }
+        #aboutBtn:hover {
+            background: #2c3e50;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        .section {
+            background: #f9f9f9;
+            border-radius: 10px;
+            padding: 16px;
+            margin: 20px 0;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            text-align: left;
+        }
+        .section-title {
+            font-size: 1.5em;
+            margin-bottom: 8px;
+            color: #2c3e50;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 6px;
+            font-weight: bold;
+        }
+        .section-info {
+            color: #7f8c8d;
+            font-size: 0.8em;
+            margin-bottom: 10px;
+            font-style: italic;
+        }
+        .sensor-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin-top: 10px;
+        }
+        .sensor-item {
+            background: white;
+            padding: 12px;
+            border-radius: 8px;
+            border-left: 4px solid #3498db;
+            cursor: pointer;
+            transition: all 0.2s;
+            position: relative;
+            min-height: 80px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+        }
+        .sensor-item:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+        }
+        .sensor-item.alarm {
+            border-left: 4px solid #e74c3c;
+            background: #fff5f5;
+        }
+        .sensor-label {
+            font-weight: bold;
+            color: #555;
+            font-size: 0.85em;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .sensor-value {
+            font-size: 1.5em;
+            font-family: 'Courier New', monospace;
+            color: #2c3e50;
+            font-weight: bold;
+            line-height: 1.2;
+        }
+        .sensor-unit {
+            font-size: 0.8em;
+            color: #7f8c8d;
+            margin-left: 2px;
+        }
+        .sensor-item.stale-data {
+            border-left: 4px solid #e74c3c !important;
+            opacity: 0.7;
+        }
+        .security-status {
+            padding: 10px;
+            border-radius: 6px;
+            margin-top: 12px;
+            text-align: center;
+            font-weight: bold;
+            font-size: 0.95em;
+            transition: all 0.3s;
+        }
+        .security-normal {
+            background: linear-gradient(135deg, #27ae60, #2ecc71);
+            color: white;
+        }
+        .security-alarm {
+            background: linear-gradient(135deg, #e74c3c, #c0392b);
+            color: white;
+            animation: alarm-pulse 1s infinite;
+        }
+        @keyframes alarm-pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
+        }
+        .led-toggle-btn {
+            font-size: 15px;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            color: white;
+            font-weight: bold;
+            transition: all 0.3s;
+            width: 280px;
+            margin: 12px 0;
+            float: left;
+            min-height: 50px;
+        }
+        .led-toggle-btn.led-on {
+            background: linear-gradient(135deg, #e74c3c, #c0392b);
+        }
+        .led-toggle-btn.led-off {
+            background: linear-gradient(135deg, #2ecc71, #27ae60);
+        }
+        .led-toggle-btn.led-unknown {
+            background: #95a5a6;
+            cursor: not-allowed;
+        }
+        .clearfix { clear: both; }
+        #lastUpdate {
+            font-size: 0.75em;
+            color: #95a5a6;
+            text-align: right;
+            margin-top: 10px;
+            font-style: italic;
+        }
+        
+        /* Компас */
+        .wind-compact {
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        .direction {
+            position: absolute;
+            font-size: 14px;
+            font-weight: bold;
+            color: #e74c3c;
+            text-shadow: 1px 1px 2px white;
+            z-index: 10;
+        }
+        .n { top: 5px; left: 50%; transform: translateX(-50%); }
+        .e { right: 5px; top: 50%; transform: translateY(-50%); }
+        .s { bottom: 5px; left: 50%; transform: translateX(-50%); }
+        .w { left: 5px; top: 50%; transform: translateY(-50%); }
+        
+        .wind-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: bold;
+            color: white;
+            margin-left: 8px;
+        }
+        .wind-badge.warning {
+            background: #ffa500 !important;
+        }
+        .wind-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 9998;
+            justify-content: center;
+            align-items: center;
+        }
+        .wind-modal-content {
+            width: 80vw;
+            height: 80vw;
+            max-width: 600px;
+            max-height: 600px;
+            background: white;
+            border-radius: 30px;
+            padding: 30px;
+            position: relative;
+        }
+        .wind-legend {
+            display: flex;
+            gap: 15px;
+            margin-top: 8px;
+            font-size: 10px;
+            color: #7f8c8d;
+        }
+        .legend-red {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background: #e74c3c;
+            border-radius: 2px;
+            margin-right: 4px;
+        }
+        .legend-yellow {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background: #f1c40f;
+            opacity: 0.7;
+            border-radius: 2px;
+            margin-right: 4px;
+        }
+        .legend-orange {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background: #ffa500;
+            border-radius: 2px;
+            margin-right: 4px;
+        }
+        
+        /* Модальное окно "О системе" */
+        .about-modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 9999;
+            justify-content: center;
+            align-items: center;
+        }
+        .about-modal-content {
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            max-width: 500px;
+            width: 90%;
+            max-height: 80vh;
+            overflow-y: auto;
+            position: relative;
+        }
+        .about-close {
+            position: absolute;
+            top: 15px;
+            right: 20px;
+            font-size: 28px;
+            font-weight: bold;
+            color: #7f8c8d;
+            cursor: pointer;
+            transition: color 0.3s;
+        }
+        .about-close:hover {
+            color: #e74c3c;
+        }
+        .about-title {
+            font-size: 24px;
+            color: #2c3e50;
+            margin-bottom: 20px;
+            text-align: center;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+        }
+        .about-version {
+            background: #ecf0f1;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+        }
+        .about-version-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            border-bottom: 1px solid #bdc3c7;
+        }
+        .about-version-item:last-child {
+            border-bottom: none;
+        }
+        .about-device {
+            font-weight: bold;
+            color: #3498db;
+        }
+        .about-ver {
+            font-family: 'Courier New', monospace;
+            background: #2c3e50;
+            color: white;
+            padding: 3px 10px;
+            border-radius: 15px;
+        }
+        .about-description {
+            margin-top: 20px;
+            color: #7f8c8d;
+            font-size: 14px;
+            line-height: 1.6;
+        }
+        
+        /* Модальное окно уставок */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0,0,0,0.8);
+            z-index: 10000;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-content {
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            max-width: 400px;
+            width: 90%;
+            position: relative;
+        }
+        .modal-close {
+            position: absolute;
+            top: 15px;
+            right: 20px;
+            font-size: 28px;
+            font-weight: bold;
+            color: #7f8c8d;
+            cursor: pointer;
+        }
+        .modal-close:hover {
+            color: #e74c3c;
+        }
+        .modal-title {
+            font-size: 20px;
+            color: #2c3e50;
+            margin-bottom: 20px;
+            text-align: center;
+            border-bottom: 2px solid #3498db;
+            padding-bottom: 10px;
+        }
+        .limits-form {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        .limit-row {
+            display: flex;
+            align-items: center;
+            gap: 15px;
+            padding: 10px;
+            background: #f5f5f5;
+            border-radius: 8px;
+        }
+        .limit-label {
+            width: 60px;
+            font-weight: bold;
+            color: #2c3e50;
+        }
+        .limit-checkbox {
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+        }
+        .limit-input {
+            width: 100px;
+            padding: 8px;
+            border: 2px solid #bdc3c7;
+            border-radius: 5px;
+            font-size: 16px;
+            text-align: center;
+        }
+        .limit-input:focus {
+            border-color: #3498db;
+            outline: none;
+        }
+        .limit-buttons {
+            display: flex;
+            gap: 5px;
+        }
+        .limit-btn {
+            width: 40px;
+            height: 40px;
+            border: none;
+            border-radius: 5px;
+            background: #3498db;
+            color: white;
+            font-size: 18px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+        .limit-btn:hover {
+            background: #2980b9;
+        }
+        .save-btn {
+            background: #27ae60;
+            color: white;
+            border: none;
+            padding: 15px;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            margin-top: 10px;
+        }
+        .save-btn:hover {
+            background: #2ecc71;
+        }
+        .sensor-limits {
+            font-size: 0.7em;
+            color: #7f8c8d;
+            margin-top: 4px;
+            font-family: monospace;
+        }
+        .sensor-limits.active {
+            color: #e67e22;
+            font-weight: bold;
+        }
+        .limits-indicator {
+            display: inline-block;
+            background: #e67e22;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            margin-left: 8px;
+        }
+        .weather-forecast {
+            margin-top: 10px;
+            padding: 8px;
+            background: #e8f4fd;
+            border-radius: 6px;
+            font-size: 0.9em;
+            text-align: center;
+        }
+        .forecast-badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: bold;
+            color: white;
+            margin-left: 8px;
+        }
+        .forecast-rain { background: #3498db; }
+        .forecast-sun { background: #f39c12; }
+        .forecast-cloud { background: #95a5a6; }
+    </style>
+</head>
+<body>
+    <div class="dashboard">
+        <h1>🏠 Умный дом ESP-NOW</h1>
+        
+        <button id="refreshBtn" onclick="refreshAllData()">🔄 ОБНОВИТЬ ВСЕ ДАННЫЕ</button>
+        <button id="aboutBtn" onclick="showAboutModal()">ℹ️ О СИСТЕМЕ</button>
+        
+        <!-- Узел #102 -->
+        <div class="section">
+            <div class="section-title">🔧 Узел #102 (Мастерская, с энкодером)</div>
+            <div class="section-info">MAC: AC:EB:E6:49:10:28</div>
+            
+            <div id="securityStatus102" class="security-status security-normal">
+                🔒 ОХРАНА: НОРМА
+            </div>
+            
+            <button id="ledToggleBtn102" class="led-toggle-btn led-unknown" onclick="toggleLED(102)">--</button>
+            <div class="clearfix"></div>
+            
+            <div class="sensor-grid">
+                <!-- Температура -->
+                <div class="sensor-item" id="sensor-temp-102" onclick="openLimitsModal('temp', 102)">
+                    <div class="sensor-label">
+                        🌡️ Температура
+                        <span class="limits-indicator" id="temp-indicator-102" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="temp-value-102">--</span>
+                        <span class="sensor-unit">°C</span>
+                    </div>
+                    <div class="sensor-limits" id="temp-limits-102"></div>
+                </div>
+                
+                <!-- Влажность -->
+                <div class="sensor-item" id="sensor-hum-102" onclick="openLimitsModal('hum', 102)">
+                    <div class="sensor-label">
+                        💧 Влажность
+                        <span class="limits-indicator" id="hum-indicator-102" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="hum-value-102">--</span>
+                        <span class="sensor-unit">%</span>
+                    </div>
+                    <div class="sensor-limits" id="hum-limits-102"></div>
+                </div>
+                
+                <!-- Давление -->
+                <div class="sensor-item" id="sensor-press-102" onclick="openLimitsModal('press', 102)">
+                    <div class="sensor-label">
+                        📊 Давление
+                        <span class="limits-indicator" id="press-indicator-102" style="display: none;">⚙️</span>
+                        <span id="press-forecast-102" class="forecast-badge"></span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="press-value-102">--</span>
+                        <span class="sensor-unit">mmHg</span>
+                    </div>
+                    <div class="sensor-limits" id="press-limits-102"></div>
+                </div>
+            </div>
+            
+            <!-- Прогноз погоды -->
+            <div id="weather-forecast-102" class="weather-forecast">
+                🌤️ Прогноз: стабильно
+            </div>
+            
+            <!-- Блок ветра -->
+            <div id="windBlock" class="wind-compact" onclick="toggleWindSize()" style="margin-top: 15px; padding-top: 10px; border-top: 1px dashed #ccc;">
+                <div style="display: flex; align-items: center; margin-bottom: 8px;">
+                    <span style="font-weight: bold; color: #2c3e50; font-size: 1.1em;">🌪️ Ветер</span>
+                    <span id="magnetIndicator" style="display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-left: 8px; background-color: #95a5a6;"></span>
+                    <span id="magnetText" style="margin-left: 4px; font-size: 0.8em; color: #7f8c8d;">магнит</span>
+                </div>
+                
+                <div style="display: flex; align-items: center;">
+                    <div style="position: relative; width: 70px; height: 70px; flex-shrink: 0;">
+                        <div class="direction n">N</div>
+                        <div class="direction e">E</div>
+                        <div class="direction s">S</div>
+                        <div class="direction w">W</div>
+                        <svg viewBox="0 0 100 100">
+                            <circle cx="50" cy="50" r="48" fill="#ecf0f1" stroke="#34495e" stroke-width="1"/>
+                            <path id="windSectorMax" d="" fill="#f1c40f" fill-opacity="0.5"/>
+                            <path id="windSector" d="" fill="#e74c3c" fill-opacity="0.7"/>
+                            <path id="windArrow" d="M50 10 L54 42 L50 50 L46 42 Z" fill="#2c3e50" stroke="white" stroke-width="1"/>
+                            <circle cx="50" cy="50" r="4" fill="#34495e" stroke="white" stroke-width="1"/>
+                        </svg>
+                    </div>
+                    
+                    <div style="margin-left: 12px; flex-grow: 1;">
+                        <div>
+                            <span id="windAngle" style="font-size: 18px; font-weight: bold;">--</span>
+                            <span style="color: #7f8c8d;">°</span>
+                            <span id="stabilityBadge" class="wind-badge">ШТИЛЬ</span>
+                        </div>
+                        <div style="color: #7f8c8d; font-size: 11px; margin-top: 4px;">
+                            <span style="color: #e74c3c;">●</span> ±<span id="sectorWidth">--</span>°
+                            <span style="margin-left: 8px; color: #f1c40f;">●</span> <span id="maxRange">---</span>
+                        </div>
+                        <div class="wind-legend">
+                            <span><span class="legend-red"></span> текущий</span>
+                            <span><span class="legend-yellow"></span> мин-макс за 30 сек</span>
+                            <span><span class="legend-orange"></span> нет сигнала</span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Узел #103 -->
+        <div class="section">
+            <div class="section-title">🔧 Узел #103</div>
+            <div class="section-info">MAC: 88:56:A6:7D:09:64</div>
+            
+            <div id="securityStatus103" class="security-status security-normal">
+                🔒 ОХРАНА: НОРМА
+            </div>
+            
+            <button id="ledToggleBtn103" class="led-toggle-btn led-unknown" onclick="toggleLED(103)">--</button>
+            <div class="clearfix"></div>
+            
+            <div class="sensor-grid">
+                <div class="sensor-item" id="sensor-temp-103" onclick="openLimitsModal('temp', 103)">
+                    <div class="sensor-label">
+                        🌡️ Температура
+                        <span class="limits-indicator" id="temp-indicator-103" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="temp-value-103">--</span>
+                        <span class="sensor-unit">°C</span>
+                    </div>
+                    <div class="sensor-limits" id="temp-limits-103"></div>
+                </div>
+                <div class="sensor-item" id="sensor-hum-103" onclick="openLimitsModal('hum', 103)">
+                    <div class="sensor-label">
+                        💧 Влажность
+                        <span class="limits-indicator" id="hum-indicator-103" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="hum-value-103">--</span>
+                        <span class="sensor-unit">%</span>
+                    </div>
+                    <div class="sensor-limits" id="hum-limits-103"></div>
+                </div>
+                <div class="sensor-item" id="sensor-press-103" onclick="openLimitsModal('press', 103)">
+                    <div class="sensor-label">
+                        📊 Давление
+                        <span class="limits-indicator" id="press-indicator-103" style="display: none;">⚙️</span>
+                        <span id="press-forecast-103" class="forecast-badge"></span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="press-value-103">--</span>
+                        <span class="sensor-unit">mmHg</span>
+                    </div>
+                    <div class="sensor-limits" id="press-limits-103"></div>
+                </div>
+            </div>
+            
+            <div id="weather-forecast-103" class="weather-forecast">
+                🌤️ Прогноз: стабильно
+            </div>
+        </div>
+
+        <!-- Узел #104 -->
+        <div class="section">
+            <div class="section-title">🔧 Узел #104</div>
+            <div class="section-info">MAC: 10:00:3B:B1:A6:9C</div>
+            
+            <div id="securityStatus104" class="security-status security-normal">
+                🔒 ОХРАНА: НОРМА
+            </div>
+            
+            <button id="ledToggleBtn104" class="led-toggle-btn led-unknown" onclick="toggleLED(104)">--</button>
+            <div class="clearfix"></div>
+            
+            <div class="sensor-grid">
+                <div class="sensor-item" id="sensor-temp-104" onclick="openLimitsModal('temp', 104)">
+                    <div class="sensor-label">
+                        🌡️ Температура
+                        <span class="limits-indicator" id="temp-indicator-104" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="temp-value-104">--</span>
+                        <span class="sensor-unit">°C</span>
+                    </div>
+                    <div class="sensor-limits" id="temp-limits-104"></div>
+                </div>
+                <div class="sensor-item" id="sensor-hum-104" onclick="openLimitsModal('hum', 104)">
+                    <div class="sensor-label">
+                        💧 Влажность
+                        <span class="limits-indicator" id="hum-indicator-104" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="hum-value-104">--</span>
+                        <span class="sensor-unit">%</span>
+                    </div>
+                    <div class="sensor-limits" id="hum-limits-104"></div>
+                </div>
+                <div class="sensor-item" id="sensor-press-104" onclick="openLimitsModal('press', 104)">
+                    <div class="sensor-label">
+                        📊 Давление
+                        <span class="limits-indicator" id="press-indicator-104" style="display: none;">⚙️</span>
+                        <span id="press-forecast-104" class="forecast-badge"></span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="press-value-104">--</span>
+                        <span class="sensor-unit">mmHg</span>
+                    </div>
+                    <div class="sensor-limits" id="press-limits-104"></div>
+                </div>
+            </div>
+            
+            <div id="weather-forecast-104" class="weather-forecast">
+                🌤️ Прогноз: стабильно
+            </div>
+        </div>
+
+        <!-- Узел #105 -->
+        <div class="section">
+            <div class="section-title">🔧 Узел #105</div>
+            <div class="section-info">MAC: 88:56:A6:7C:F2:A8</div>
+            
+            <div id="securityStatus105" class="security-status security-normal">
+                🔒 ОХРАНА: НОРМА
+            </div>
+            
+            <button id="ledToggleBtn105" class="led-toggle-btn led-unknown" onclick="toggleLED(105)">--</button>
+            <div class="clearfix"></div>
+            
+            <div class="sensor-grid">
+                <div class="sensor-item" id="sensor-temp-105" onclick="openLimitsModal('temp', 105)">
+                    <div class="sensor-label">
+                        🌡️ Температура
+                        <span class="limits-indicator" id="temp-indicator-105" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="temp-value-105">--</span>
+                        <span class="sensor-unit">°C</span>
+                    </div>
+                    <div class="sensor-limits" id="temp-limits-105"></div>
+                </div>
+                <div class="sensor-item" id="sensor-hum-105" onclick="openLimitsModal('hum', 105)">
+                    <div class="sensor-label">
+                        💧 Влажность
+                        <span class="limits-indicator" id="hum-indicator-105" style="display: none;">⚙️</span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="hum-value-105">--</span>
+                        <span class="sensor-unit">%</span>
+                    </div>
+                    <div class="sensor-limits" id="hum-limits-105"></div>
+                </div>
+                <div class="sensor-item" id="sensor-press-105" onclick="openLimitsModal('press', 105)">
+                    <div class="sensor-label">
+                        📊 Давление
+                        <span class="limits-indicator" id="press-indicator-105" style="display: none;">⚙️</span>
+                        <span id="press-forecast-105" class="forecast-badge"></span>
+                    </div>
+                    <div>
+                        <span class="sensor-value" id="press-value-105">--</span>
+                        <span class="sensor-unit">mmHg</span>
+                    </div>
+                    <div class="sensor-limits" id="press-limits-105"></div>
+                </div>
+            </div>
+            
+            <div id="weather-forecast-105" class="weather-forecast">
+                🌤️ Прогноз: стабильно
+            </div>
+        </div>
+
+        <!-- Теплица -->
+        <div class="section">
+            <div class="section-title">🌿 Теплица</div>
+            <div class="section-info">MAC: E8:9F:6D:87:34:8A</div>
+            <div class="sensor-grid" id="greenhouseData">
+                <div class="sensor-item">
+                    <div class="sensor-label">Температура (внутри):</div>
+                    <div><span class="sensor-value">--</span><span class="sensor-unit">°C</span></div>
+                </div>
+                <div class="sensor-item">
+                    <div class="sensor-label">Температура (улица):</div>
+                    <div><span class="sensor-value">--</span><span class="sensor-unit">°C</span></div>
+                </div>
+                <div class="sensor-item">
+                    <div class="sensor-label">Влажность (внутри):</div>
+                    <div><span class="sensor-value">--</span><span class="sensor-unit">%</span></div>
+                </div>
+            </div>
+            <div id="lastUpdate">Ожидание данных от теплицы...</div>
+        </div>
+    </div>
+
+    <!-- Модальное окно компаса -->
+    <div id="windModal" class="wind-modal" onclick="toggleWindSize()">
+        <div class="wind-modal-content" onclick="event.stopPropagation()">
+            <div style="position: relative; width: 100%; height: 100%;">
+                <div class="direction n">N</div>
+                <div class="direction e">E</div>
+                <div class="direction s">S</div>
+                <div class="direction w">W</div>
+                <svg viewBox="0 0 100 100">
+                    <circle cx="50" cy="50" r="48" fill="#ecf0f1" stroke="#34495e" stroke-width="2"/>
+                    <path id="windSectorMaxLarge" d="" fill="#f1c40f" fill-opacity="0.5"/>
+                    <path id="windSectorLarge" d="" fill="#e74c3c" fill-opacity="0.7"/>
+                    <path id="windArrowLarge" d="M50 10 L54 42 L50 50 L46 42 Z" fill="#2c3e50" stroke="white" stroke-width="1.5"/>
+                    <circle cx="50" cy="50" r="4" fill="#34495e" stroke="white" stroke-width="2"/>
+                </svg>
+            </div>
+            <div style="text-align: center; margin-top: 20px;">
+                <span style="font-size: 32px; font-weight: bold;" id="windAngleLarge">--</span>
+                <span style="font-size: 20px; color: #7f8c8d;">°</span>
+                <span id="stabilityBadgeLarge" style="display: inline-block; padding: 8px 20px; border-radius: 20px; font-size: 16px; font-weight: bold; color: white; margin-left: 15px;">ШТИЛЬ</span>
+                <div style="margin-top: 15px; color: #7f8c8d; font-size: 18px;">
+                    <span style="color: #e74c3c;">●</span> ±<span id="sectorWidthLarge">--</span>°
+                    <span style="margin-left: 20px; color: #f1c40f;">●</span> <span id="maxRangeLarge">---</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно уставок -->
+    <div id="limitsModal" class="modal">
+        <div class="modal-content">
+            <span class="modal-close" onclick="closeLimitsModal()">&times;</span>
+            <div class="modal-title" id="modal-title">Настройка уставок</div>
+            
+            <div class="limits-form">
+                <div class="limit-row">
+                    <span class="limit-label">МИН</span>
+                    <input type="checkbox" id="min-enable" class="limit-checkbox">
+                    <input type="number" id="min-value" class="limit-input" step="0.1" value="18.0">
+                    <div class="limit-buttons">
+                        <button class="limit-btn" onclick="adjustMin(-1)">-1</button>
+                        <button class="limit-btn" onclick="adjustMin(1)">+1</button>
+                    </div>
+                </div>
+                
+                <div class="limit-row">
+                    <span class="limit-label">МАКС</span>
+                    <input type="checkbox" id="max-enable" class="limit-checkbox">
+                    <input type="number" id="max-value" class="limit-input" step="0.1" value="25.0">
+                    <div class="limit-buttons">
+                        <button class="limit-btn" onclick="adjustMax(-1)">-1</button>
+                        <button class="limit-btn" onclick="adjustMax(1)">+1</button>
+                    </div>
+                </div>
+                
+                <button class="save-btn" onclick="saveLimits()">💾 СОХРАНИТЬ</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Модальное окно "О системе" -->
+    <div id="aboutModal" class="about-modal" onclick="hideAboutModal()">
+        <div class="about-modal-content" onclick="event.stopPropagation()">
+            <span class="about-close" onclick="hideAboutModal()">&times;</span>
+            <div class="about-title">ℹ️ О системе</div>
+            
+            <div class="about-version">
+                <div class="about-version-item">
+                    <span class="about-device">Хаб (ESP32)</span>
+                    <span class="about-ver" id="hubVersion">5.7</span>
+                </div>
+                <div class="about-version-item">
+                    <span class="about-device">Узел #102</span>
+                    <span class="about-ver" id="node102Version">2.1</span>
+                </div>
+                <div class="about-version-item">
+                    <span class="about-device">Узел #103</span>
+                    <span class="about-ver" id="node103Version">2.1</span>
+                </div>
+                <div class="about-version-item">
+                    <span class="about-device">Узел #104</span>
+                    <span class="about-ver" id="node104Version">2.1</span>
+                </div>
+                <div class="about-version-item">
+                    <span class="about-device">Узел #105</span>
+                    <span class="about-ver" id="node105Version">2.1</span>
+                </div>
+            </div>
+            
+            <div class="about-description">
+                <strong>Описание:</strong>
+                <ul>
+                    <li>ESP-NOW хаб для умного дома</li>
+                    <li>Поддержка 4 узлов + теплица</li>
+                    <li>Управление LED с веб-интерфейса</li>
+                    <li>Уставки для всех датчиков</li>
+                    <li>Прогноз погоды по давлению</li>
+                </ul>
+                <strong>Версия хаба:</strong> 5.7<br>
+                <strong>Версия узлов:</strong> 2.1
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const ws = new WebSocket('ws://' + window.location.hostname + '/ws');
+        let ledState = {102: 'unknown', 103: 'unknown', 104: 'unknown', 105: 'unknown'};
+        let buttonLocked = {102: false, 103: false, 104: false, 105: false};
+        let audioContext = null;
+        let alarmInterval = null;
+        let isAlarmPlaying = false;
+        
+        // Текущий выбранный датчик для уставок
+        let currentSensor = { nodeId: 102, type: 'temp' };
+
+        function initAudio() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            }
+        }
+        document.addEventListener('click', initAudio);
+
+        function playAlarmTone() {
+            if (isAlarmPlaying || !audioContext) return;
+            isAlarmPlaying = true;
+            
+            function playPulse(freq, dur) {
+                let osc = audioContext.createOscillator();
+                let gain = audioContext.createGain();
+                osc.connect(gain);
+                gain.connect(audioContext.destination);
+                osc.frequency.value = freq;
+                osc.type = 'sawtooth';
+                gain.gain.value = 0.15;
+                osc.start();
+                gain.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + dur);
+                osc.stop(audioContext.currentTime + dur);
+            }
+            
+            alarmInterval = setInterval(() => {
+                playPulse(800, 0.1);
+                setTimeout(() => playPulse(1200, 0.1), 150);
+            }, 500);
+        }
+
+        function stopAlarm() {
+            isAlarmPlaying = false;
+            if (alarmInterval) {
+                clearInterval(alarmInterval);
+                alarmInterval = null;
+            }
+        }
+
+        function playShortBeep() {
+            if (!audioContext) return;
+            function beep(freq, dur) {
+                let osc = audioContext.createOscillator();
+                let gain = audioContext.createGain();
+                osc.connect(gain);
+                gain.connect(audioContext.destination);
+                osc.frequency.value = freq;
+                osc.type = 'sawtooth';
+                gain.gain.value = 0.1;
+                osc.start();
+                gain.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + dur);
+                osc.stop(audioContext.currentTime + dur);
+            }
+            beep(600, 0.2);
+            setTimeout(() => beep(400, 0.3), 300);
+        }
+
+        function showAboutModal() {
+            document.getElementById('aboutModal').style.display = 'flex';
+        }
+
+        function hideAboutModal() {
+            document.getElementById('aboutModal').style.display = 'none';
+        }
+
+        function toggleWindSize() {
+            let modal = document.getElementById('windModal');
+            if (modal.style.display === 'flex') {
+                modal.style.display = 'none';
+            } else {
+                modal.style.display = 'flex';
+                updateLargeWindDisplay();
+            }
+        }
+
+        function updateLEDButton(nodeId) {
+            let btn = document.getElementById('ledToggleBtn' + nodeId);
+            if (ledState[nodeId] === 'on') {
+                btn.textContent = '⏸ ВЫКЛЮЧИТЬ LED';
+                btn.className = 'led-toggle-btn led-on';
+                btn.disabled = false;
+            } else if (ledState[nodeId] === 'off') {
+                btn.textContent = '▶ ВКЛЮЧИТЬ LED';
+                btn.className = 'led-toggle-btn led-off';
+                btn.disabled = false;
+            } else {
+                btn.textContent = '-- (статус неизвестен)';
+                btn.className = 'led-toggle-btn led-unknown';
+                btn.disabled = true;
+            }
+        }
+
+        function toggleLED(nodeId) {
+            if (buttonLocked[nodeId] || ws.readyState !== WebSocket.OPEN) return;
+            let cmd = (ledState[nodeId] === 'on') ? 'LED_OFF' : 'LED_ON';
+            buttonLocked[nodeId] = true;
+            let btn = document.getElementById('ledToggleBtn' + nodeId);
+            btn.disabled = true;
+            setTimeout(() => { buttonLocked[nodeId] = false; updateLEDButton(nodeId); }, 5000);
+            ws.send(JSON.stringify({command: cmd, node: nodeId}));
+        }
+
+        function refreshAllData() {
+            ws.send(JSON.stringify({command: 'GET_STATUS'}));
+        }
+
+        function markNodeDataAsStale(nodeId) {
+            let items = document.querySelectorAll('#nodeSensorData' + nodeId + ' .sensor-item');
+            items.forEach(i => i.classList.add('stale-data'));
+            playShortBeep();
+        }
+
+        function updateSecurityStatus(nodeId, alarm, c1, c2) {
+            let el = document.getElementById('securityStatus' + nodeId);
+            if (alarm) {
+                el.className = 'security-status security-alarm';
+                let txt = '🚨 ТРЕВОГА! ';
+                if (c1 && c2) txt += 'ОБА КОНЦЕВИКА!';
+                else if (c1) txt += 'Концевик 1 разорван';
+                else if (c2) txt += 'Концевик 2 разорван';
+                el.innerHTML = txt;
+                playAlarmTone();
+            } else {
+                el.className = 'security-status security-normal';
+                el.innerHTML = '🔒 ОХРАНА: НОРМА';
+                let anyAlarm = false;
+                for (let id of [102, 103, 104, 105]) {
+                    let statusEl = document.getElementById('securityStatus' + id);
+                    if (statusEl && statusEl.className.includes('security-alarm')) {
+                        anyAlarm = true;
+                        break;
+                    }
+                }
+                if (!anyAlarm) stopAlarm();
+            }
+        }
+
+        // Функции для уставок
+        function openLimitsModal(type, nodeId) {
+            currentSensor = { nodeId: nodeId, type: type };
+            let names = { temp: 'Температура', hum: 'Влажность', press: 'Давление' };
+            document.getElementById('modal-title').innerHTML = `Узел #${nodeId} — ${names[type]}`;
+            
+            // Здесь можно запросить текущие уставки с хаба
+            document.getElementById('limitsModal').style.display = 'flex';
+        }
+
+        function closeLimitsModal() {
+            document.getElementById('limitsModal').style.display = 'none';
+        }
+
+        function adjustMin(delta) {
+            let input = document.getElementById('min-value');
+            let val = parseFloat(input.value) + delta;
+            input.value = val.toFixed(1);
+        }
+
+        function adjustMax(delta) {
+            let input = document.getElementById('max-value');
+            let val = parseFloat(input.value) + delta;
+            input.value = val.toFixed(1);
+        }
+
+        function saveLimits() {
+            let minEnabled = document.getElementById('min-enable').checked;
+            let minVal = parseFloat(document.getElementById('min-value').value);
+            let maxEnabled = document.getElementById('max-enable').checked;
+            let maxVal = parseFloat(document.getElementById('max-value').value);
+            
+            // Отправляем на хаб
+            ws.send(JSON.stringify({
+                type: 'set_limits',
+                node: currentSensor.nodeId,
+                sensor: currentSensor.type,
+                min: { enabled: minEnabled, value: minVal },
+                max: { enabled: maxEnabled, value: maxVal }
+            }));
+            
+            closeLimitsModal();
+        }
+
+        // Функции для ветра
+        function drawSector(pathId, start, end) {
+            let path = document.getElementById(pathId);
+            if (!path) return;
+            let cx = 50, cy = 50, r = 48;
+            
+            function degToRad(d) {
+                return (d - 90) * Math.PI / 180;
+            }
+            
+            let startRad = degToRad(start);
+            let endRad = degToRad(end);
+            
+            let x1 = cx + r * Math.cos(startRad);
+            let y1 = cy + r * Math.sin(startRad);
+            let x2 = cx + r * Math.cos(endRad);
+            let y2 = cy + r * Math.sin(endRad);
+            
+            let angleDiff = end - start;
+            if (angleDiff < 0) angleDiff += 360;
+            let largeArc = angleDiff > 180 ? 1 : 0;
+            
+            let d = `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2} Z`;
+            path.setAttribute('d', d);
+        }
+
+        function rotateArrow(arrowId, deg) {
+            let arrow = document.getElementById(arrowId);
+            if (arrow) {
+                arrow.setAttribute('transform', `rotate(${deg}, 50, 50)`);
+            }
+        }
+
+        function updateLargeWindDisplay() {
+            document.getElementById('windAngleLarge').textContent = document.getElementById('windAngle').textContent;
+            document.getElementById('sectorWidthLarge').textContent = document.getElementById('sectorWidth').textContent;
+            document.getElementById('maxRangeLarge').innerHTML = document.getElementById('maxRange').innerHTML;
+            
+            let badge = document.getElementById('stabilityBadge');
+            let badgeLarge = document.getElementById('stabilityBadgeLarge');
+            badgeLarge.textContent = badge.textContent;
+            badgeLarge.style.backgroundColor = badge.style.backgroundColor;
+            
+            let sector = document.getElementById('windSector');
+            let sectorLarge = document.getElementById('windSectorLarge');
+            sectorLarge.setAttribute('d', sector.getAttribute('d'));
+            
+            let sectorMax = document.getElementById('windSectorMax');
+            let sectorMaxLarge = document.getElementById('windSectorMaxLarge');
+            if (sectorMax && sectorMaxLarge) {
+                sectorMaxLarge.setAttribute('d', sectorMax.getAttribute('d'));
+            }
+            
+            let arrow = document.getElementById('windArrow');
+            let arrowLarge = document.getElementById('windArrowLarge');
+            arrowLarge.setAttribute('transform', arrow.getAttribute('transform'));
+        }
+
+        // WebSocket обработчик
+        ws.onmessage = function(event) {
+            let msg = JSON.parse(event.data);
+            
+            if (msg.type === 'node_status') {
+                ledState[msg.node] = msg.state;
+                buttonLocked[msg.node] = false;
+                updateLEDButton(msg.node);
+            }
+            else if (msg.type === 'sensor_data') {
+                let nodeId = msg.node;
+                if (msg.temp !== undefined) {
+                    document.getElementById('temp-value-' + nodeId).textContent = msg.temp.toFixed(1);
+                }
+                if (msg.hum !== undefined) {
+                    document.getElementById('hum-value-' + nodeId).textContent = msg.hum.toFixed(1);
+                }
+                if (msg.press !== undefined) {
+                    document.getElementById('press-value-' + nodeId).textContent = msg.press.toFixed(1);
+                }
+            }
+            else if (msg.type === 'security') {
+                updateSecurityStatus(msg.node, msg.alarm, msg.contact1, msg.contact2);
+            }
+            else if (msg.type === 'connection_lost') {
+                markNodeDataAsStale(msg.node);
+            }
+            else if (msg.type === 'gpio_status') {
+                if (msg.gpio8 !== undefined) {
+                    ledState[msg.node] = msg.gpio8 ? 'on' : 'off';
+                    updateLEDButton(msg.node);
+                }
+            }
+            else if (msg.type === 'greenhouse_data') {
+                let items = document.querySelectorAll('#greenhouseData .sensor-value');
+                if (items.length >= 3) {
+                    items[0].textContent = msg.temp_in;
+                    items[1].textContent = msg.temp_out;
+                    items[2].textContent = msg.hum_in;
+                }
+                document.getElementById('lastUpdate').textContent = `Обновлено: ${new Date().toLocaleTimeString()}`;
+            }
+            else if (msg.type === 'wind') {
+                document.getElementById('windAngle').textContent = msg.angle_avg;
+                document.getElementById('sectorWidth').textContent = msg.sector_width;
+                document.getElementById('maxRange').innerHTML = `${msg.history_min}° - ${msg.history_max}°`;
+                
+                let magnet = document.getElementById('magnetIndicator');
+                let magnetText = document.getElementById('magnetText');
+                let badge = document.getElementById('stabilityBadge');
+                
+                if (msg.stability === 'no_signal') {
+                    magnet.style.backgroundColor = '#ffa500';
+                    magnetText.textContent = 'нет сигнала';
+                    badge.textContent = 'НЕТ СИГНАЛА';
+                    badge.className = 'wind-badge warning';
+                    drawSector('windSector', 0, 360);
+                } else if (msg.stability === 'no_magnet') {
+                    magnet.style.backgroundColor = '#ffa500';
+                    magnetText.textContent = 'магнит?';
+                    badge.textContent = 'МАГНИТ?';
+                    badge.className = 'wind-badge warning';
+                    drawSector('windSector', 0, 360);
+                } else {
+                    if (msg.magnet) {
+                        magnet.style.backgroundColor = '#27ae60';
+                        magnetText.textContent = 'магнит есть';
+                    } else {
+                        magnet.style.backgroundColor = '#e74c3c';
+                        magnetText.textContent = 'магнит нет';
+                    }
+                    
+                    let stability = msg.stability;
+                    let text = '', color = '';
+                    
+                    switch(stability) {
+                        case 'calm':   text = 'ШТИЛЬ';    color = '#3498db'; break;
+                        case 'gusty':  text = 'ПОРЫВИСТЫЙ'; color = '#e67e22'; break;
+                        case 'strong': text = 'СИЛЬНЫЙ';   color = '#e74c3c'; break;
+                        case 'storm':  text = 'ШТОРМ';     color = '#8e44ad'; break;
+                        default:       text = 'ШТИЛЬ';    color = '#3498db';
+                    }
+                    
+                    badge.textContent = text;
+                    badge.style.backgroundColor = color;
+                    badge.className = 'wind-badge';
+                    
+                    if (msg.sector_start !== undefined && msg.sector_end !== undefined) {
+                        drawSector('windSector', parseFloat(msg.sector_start), parseFloat(msg.sector_end));
+                    }
+                    
+                    if (msg.history_min !== undefined && msg.history_max !== undefined) {
+                        drawSector('windSectorMax', parseFloat(msg.history_min), parseFloat(msg.history_max));
+                    }
+                }
+                
+                rotateArrow('windArrow', parseFloat(msg.angle_avg));
+                
+                if (document.getElementById('windModal').style.display === 'flex') {
+                    updateLargeWindDisplay();
+                }
+            }
+            else if (msg.type === 'limits_update') {
+                let suffix = msg.node + '-' + msg.sensor;
+                let indicator = document.getElementById(msg.sensor + '-indicator-' + msg.node);
+                let limitsEl = document.getElementById(msg.sensor + '-limits-' + msg.node);
+                
+                if (msg.min.enabled || msg.max.enabled) {
+                    indicator.style.display = 'inline-block';
+                    let text = '';
+                    if (msg.min.enabled) text += '↓' + msg.min.value.toFixed(1);
+                    if (msg.max.enabled) {
+                        if (msg.min.enabled) text += ' ';
+                        text += '↑' + msg.max.value.toFixed(1);
+                    }
+                    limitsEl.innerHTML = text;
+                    limitsEl.classList.add('active');
+                } else {
+                    indicator.style.display = 'none';
+                    limitsEl.innerHTML = '';
+                    limitsEl.classList.remove('active');
+                }
+            }
+            else if (msg.type === 'weather_forecast') {
+                let forecastEl = document.getElementById('weather-forecast-' + msg.node);
+                forecastEl.className = 'weather-forecast ' + msg.forecast_class;
+                forecastEl.innerHTML = msg.forecast_text;
+            }
+        };
+
+        ws.onopen = function() {
+            for (let id of [102, 103, 104, 105]) {
+                updateLEDButton(id);
+            }
+            ws.send(JSON.stringify({command: 'GET_STATUS'}));
+        };
+
+        ws.onclose = function() {
+            for (let id of [102, 103, 104, 105]) {
+                ledState[id] = 'unknown';
+                updateLEDButton(id);
+            }
+        };
+
+        // Закрытие модальных окон по ESC
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                hideAboutModal();
+                document.getElementById('windModal').style.display = 'none';
+                closeLimitsModal();
+            }
+        });
+
+        window.onclick = function(event) {
+            let modal = document.getElementById('limitsModal');
+            if (event.target === modal) closeLimitsModal();
+        };
+    </script>
+</body>
+</html>
