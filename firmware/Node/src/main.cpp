@@ -70,9 +70,16 @@ void setup() {
     Serial.begin(115200);
     delay(3000);  // Ждём 3 секунды для стабилизации
 
-    // Вывод информации о узле в монитор порта
-    Serial.println("\n=== УЗЕЛ ESP-NOW #" String(NODE_ID) " (JSON версия с охраной, эмуляция датчиков) ===");
-    Serial.println("MAC: " String(NODE_MAC_STR) " | ID: " String(NODE_ID));
+    // Вывод информации о узле в монитор порта (ИСПРАВЛЕНО)
+    Serial.print("\n=== УЗЕЛ ESP-NOW #");
+    Serial.print(NODE_ID);
+    Serial.println(" (JSON версия с охраной, эмуляция датчиков) ===");
+    
+    Serial.print("MAC: ");
+    Serial.print(NODE_MAC_STR);
+    Serial.print(" | ID: ");
+    Serial.println(NODE_ID);
+    
     Serial.println("Концевики: GPIO3 и GPIO4 (тревога при РАЗРЫВЕ цепи)");
     Serial.println("Режим: ЭМУЛЯЦИЯ ДАТЧИКОВ (без I2C)");
 
@@ -132,7 +139,10 @@ void setup() {
     // ВАЖНО! Отправка начального статуса LED, чтобы кнопка в веб-интерфейсе стала активной
     sendGpioStatus();
 
-    Serial.println("\n=== УЗЕЛ #" String(NODE_ID) " ГОТОВ К РАБОТЕ (ЭМУЛЯЦИЯ) ===\n");
+    // Финальное сообщение о готовности (ИСПРАВЛЕНО)
+    Serial.print("\n=== УЗЕЛ #");
+    Serial.print(NODE_ID);
+    Serial.println(" ГОТОВ К РАБОТЕ (ЭМУЛЯЦИЯ) ===\n");
     
     // Первое чтение эмулированных данных датчиков
     readAndSendSensorData();
