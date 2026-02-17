@@ -1,8 +1,7 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
- * ВЕРСИЯ 5.5: БЕЗ ГЛОБАЛЬНОЙ ТРЕВОГИ
- * Добавлена поддержка 4 узлов (ID 102, 103, 104, 105)
- * Добавлена кнопка "О системе" с версиями прошивок
+ * ВЕРСИЯ 5.6: ГЛОБАЛЬНАЯ ТРЕВОГА + АВТОЗАПРОС СТАТУСА LED
+ * Исправлено: при загрузке страницы сразу запрашивается статус LED
  */
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
@@ -16,8 +15,8 @@ const char* AP_SSID = "SmartHome-Hub";
 const char* AP_PASSWORD = "12345678";
 
 // Версии прошивок
-const char* HUB_VERSION = "5.5";
-const char* NODE_VERSION = "2.1";  // Все узлы используют одну версию
+const char* HUB_VERSION = "5.6";  // Обновлена версия
+const char* NODE_VERSION = "2.1";
 
 // MAC адреса узлов
 // Узел #102 - основной, с энкодером
@@ -53,6 +52,13 @@ bool nodeConnectionLost[NODE_COUNT] = {false, false, false, false};
 unsigned long connectionLostTime[NODE_COUNT] = {0, 0, 0, 0};
 const unsigned long CONNECTION_LOST_COOLDOWN = 10000;
 
+// Статусы тревоги для каждого узла
+bool nodeAlarmState[NODE_COUNT] = {false, false, false, false};
+
+// Статусы LED для каждого узла (ДОБАВЛЕНО)
+bool nodeLedState[NODE_COUNT] = {false, false, false, false}; // true = ON, false = OFF
+bool nodeLedKnown[NODE_COUNT] = {false, false, false, false}; // известен ли статус
+
 // ---- 2. УНИВЕРСАЛЬНАЯ СТРУКТУРА ESP-NOW ----
 typedef struct esp_now_message {
     char json[192];
@@ -86,6 +92,9 @@ const unsigned long GREENHOUSE_UPDATE_INTERVAL = 30000;
 bool securityAlarmActive = false;
 unsigned long alarmStartTime = 0;
 const unsigned long ALARM_DURATION_MS = 10000;
+
+// Глобальная тревога
+bool globalAlarmActive = false;
 
 // ---- 5. ДАННЫЕ ЭНКОДЕРА AS5600 - ДВЕ ТОЧКИ + ИСТОРИЯ 30 СЕК ----
 #define ENCODER_HISTORY_SIZE 6        // 6 значений = 30 секунд при 5 сек
@@ -125,14 +134,17 @@ void processEncoderData(float angle, bool magnet);
 void updateHistory(float angle);
 void updateMaxMin();
 void broadcastEncoderData();
+void checkGlobalAlarm();
+void requestAllNodesStatus();  // ДОБАВЛЕНО: функция для запроса статуса всех узлов
+void requestNodeStatus(int nodeIndex); // ДОБАВЛЕНО: запрос статуса конкретного узла
 
 // ===================== SETUP =====================
 void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 5.5) ===");
-    Serial.println("=== БЕЗ ГЛОБАЛЬНОЙ ТРЕВОГИ ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 5.6) ===");
+    Serial.println("=== АВТОЗАПРОС СТАТУСА LED ПРИ ПОДКЛЮЧЕНИИ ===");
 
     // ИНИЦИАЛИЗАЦИЯ ИСТОРИИ
     historyCount = 0;
@@ -213,6 +225,23 @@ void setup() {
             background: #2c3e50;
             transform: translateY(-2px);
             box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        }
+        .global-alarm-banner {
+            background: #ff4444;
+            color: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            text-align: center;
+            font-size: 24px;
+            font-weight: bold;
+            animation: alarm-pulse 1s infinite;
+            display: none;
+        }
+        @keyframes alarm-pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.7; }
+            100% { opacity: 1; }
         }
         .section {
             background: #f9f9f9;
@@ -539,6 +568,11 @@ void setup() {
         <button id="refreshBtn" onclick="refreshAllData()">🔄 ОБНОВИТЬ ВСЕ ДАННЫЕ</button>
         <button id="aboutBtn" onclick="showAboutModal()">ℹ️ О СИСТЕМЕ</button>
         
+        <!-- Глобальная тревога -->
+        <div id="globalAlarmBanner" class="global-alarm-banner">
+            🚨 ГЛОБАЛЬНАЯ ТРЕВОГА 🚨
+        </div>
+        
         <div class="section">
             <div class="section-title">🔧 Узел #102 (Мастерская, с энкодером)</div>
             <div class="section-info">MAC: AC:EB:E6:49:10:28</div>
@@ -551,7 +585,7 @@ void setup() {
             <div class="clearfix"></div>
             
             <div id="nodeSensorData102">
-                <p>Нажмите "Обновить все данные" для получения показаний</p>
+                <p>Запрос данных...</p>
             </div>
             
             <!-- БЛОК ВЕТРА (только для узла #102) -->
@@ -611,7 +645,7 @@ void setup() {
             <div class="clearfix"></div>
             
             <div id="nodeSensorData103">
-                <p>Ожидание данных...</p>
+                <p>Запрос данных...</p>
             </div>
         </div>
 
@@ -627,7 +661,7 @@ void setup() {
             <div class="clearfix"></div>
             
             <div id="nodeSensorData104">
-                <p>Ожидание данных...</p>
+                <p>Запрос данных...</p>
             </div>
         </div>
 
@@ -643,7 +677,7 @@ void setup() {
             <div class="clearfix"></div>
             
             <div id="nodeSensorData105">
-                <p>Ожидание данных...</p>
+                <p>Запрос данных...</p>
             </div>
         </div>
 
@@ -713,7 +747,7 @@ void setup() {
             <div class="about-version">
                 <div class="about-version-item">
                     <span class="about-device">Хаб (ESP32)</span>
-                    <span class="about-ver" id="hubVersion">5.5</span>
+                    <span class="about-ver" id="hubVersion">5.6</span>
                 </div>
                 <div class="about-version-item">
                     <span class="about-device">Узел #102 (с энкодером)</span>
@@ -745,10 +779,12 @@ void setup() {
                     <li>Датчики: AHT20, BMP280, AS5600 (энкодер)</li>
                     <li>Охрана с концевиками (GPIO3, GPIO4)</li>
                     <li>Управление LED (GPIO8) с веб-интерфейса</li>
+                    <li>Автозапрос статуса LED при загрузке страницы</li>
                     <li>Ветер: отображение направления, размаха, желтый сектор 30 сек, штиль/шторм</li>
                     <li>Автоопределение потери связи (70 сек)</li>
+                    <li>Глобальная тревога при срабатывании любого узла</li>
                 </ul>
-                <strong>Версия хаба:</strong> 5.5<br>
+                <strong>Версия хаба:</strong> 5.6<br>
                 <strong>Версия узлов:</strong> 2.1<br>
                 <strong>Дата сборки:</strong> 2024
             </div>
@@ -926,6 +962,25 @@ void setup() {
             }
         }
 
+        // ДОБАВЛЕНО: функция для отображения глобальной тревоги
+        function showGlobalAlarm(active) {
+            let banner = document.getElementById('globalAlarmBanner');
+            if (active) {
+                banner.style.display = 'block';
+                playAlarmTone();
+            } else {
+                banner.style.display = 'none';
+                let anyAlarm = false;
+                for (let id of [102, 103, 104, 105]) {
+                    if (document.getElementById('securityStatus' + id).className.includes('security-alarm')) {
+                        anyAlarm = true;
+                        break;
+                    }
+                }
+                if (!anyAlarm) stopAlarm();
+            }
+        }
+
         function drawSector(pathId, start, end) {
             let path = document.getElementById(pathId);
             if (!path) return;
@@ -982,6 +1037,9 @@ void setup() {
             }
             else if (msg.type === 'security') {
                 updateSecurityStatus(msg.node, msg.alarm, msg.contact1, msg.contact2);
+            }
+            else if (msg.type === 'global_alarm') {
+                showGlobalAlarm(msg.state);
             }
             else if (msg.type === 'connection_lost') {
                 markNodeDataAsStale(msg.node);
@@ -1069,19 +1127,19 @@ void setup() {
         };
 
         ws.onopen = function() {
-            for (let id of [102, 103, 104, 105]) {
-                updateLEDButton(id);
-            }
-            ws.send(JSON.stringify({command: 'GET_STATUS'}));
+            console.log('WebSocket connected');
+            // При открытии соединения кнопки будут обновлены после получения статусов
         };
 
         ws.onclose = function() {
+            console.log('WebSocket disconnected');
             for (let id of [102, 103, 104, 105]) {
                 ledState[id] = 'unknown';
                 updateLEDButton(id);
             }
         };
 
+        // Инициализация кнопок при загрузке
         for (let id of [102, 103, 104, 105]) {
             updateLEDButton(id);
         }
@@ -1141,9 +1199,9 @@ void setup() {
     Serial.println("\n=== ХАБ ГОТОВ К РАБОТЕ ===");
     Serial.println("1. Подключитесь к Wi-Fi: " + String(AP_SSID));
     Serial.println("2. Откройте: http://" + WiFi.softAPIP().toString());
-    Serial.println("3. Ветер: желтый сектор 30 сек, штиль/шторм РАБОТАЕТ");
+    Serial.println("3. При загрузке страницы автоматически запрашивается статус LED");
     Serial.println("4. Поддерживается 4 узла (ID 102, 103, 104, 105)");
-    Serial.println("5. Версия хаба: 5.5 (без глобальной тревоги), версия узлов: 2.1\n");
+    Serial.println("5. Версия хаба: 5.6 (автозапрос статуса LED), версия узлов: 2.1\n");
 }
 
 void loop() {
@@ -1159,6 +1217,22 @@ void loop() {
     }
     
     delay(100);
+}
+
+// ДОБАВЛЕНО: функция запроса статуса конкретного узла
+void requestNodeStatus(int nodeIndex) {
+    if (nodeIndex >= 0 && nodeIndex < NODE_COUNT) {
+        Serial.printf("📡 Запрос статуса узла #%d\n", nodeNumbers[nodeIndex]);
+        sendToNode(nodeMacs[nodeIndex], "GET_STATUS");
+    }
+}
+
+// ДОБАВЛЕНО: функция запроса статуса всех узлов
+void requestAllNodesStatus() {
+    Serial.println("📡 Запрос статуса всех узлов");
+    for (int i = 0; i < NODE_COUNT; i++) {
+        requestNodeStatus(i);
+    }
 }
 
 void sendConnectionStatusToWeb(int nodeIndex, bool connected) {
@@ -1195,13 +1269,57 @@ void checkNodeConnection() {
 void updateAlarmState() {
     if (securityAlarmActive && (millis() - alarmStartTime) > ALARM_DURATION_MS) {
         securityAlarmActive = false;
+        checkGlobalAlarm();
     }
 }
 
+// ДОБАВЛЕНО: функция проверки глобальной тревоги
+void checkGlobalAlarm() {
+    bool newGlobalAlarm = false;
+    for (int i = 0; i < NODE_COUNT; i++) {
+        if (nodeAlarmState[i]) {
+            newGlobalAlarm = true;
+            break;
+        }
+    }
+    
+    if (newGlobalAlarm != globalAlarmActive) {
+        globalAlarmActive = newGlobalAlarm;
+        if (globalAlarmActive) {
+            Serial.println("🚨 ГЛОБАЛЬНАЯ ТРЕВОГА!");
+        } else {
+            Serial.println("✅ Глобальная тревога снята");
+        }
+        
+        // Отправляем статус в WebSocket
+        StaticJsonDocument<100> doc;
+        doc["type"] = "global_alarm";
+        doc["state"] = globalAlarmActive;
+        String json;
+        serializeJson(doc, json);
+        ws.textAll(json);
+    }
+}
+
+// ИСПРАВЛЕНО: при подключении клиента запрашиваем статусы всех узлов
 void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                      AwsEventType type, void *arg, uint8_t *data, size_t len) {
     if (type == WS_EVT_CONNECT) {
-        // Ничего не отправляем при подключении
+        Serial.printf("✅ Новый клиент подключен: %u\n", client->id());
+        
+        // Отправляем текущий статус глобальной тревоги новому клиенту
+        StaticJsonDocument<100> doc;
+        doc["type"] = "global_alarm";
+        doc["state"] = globalAlarmActive;
+        String json;
+        serializeJson(doc, json);
+        client->text(json);
+        
+        // ИСПРАВЛЕНИЕ: запрашиваем статус всех узлов при подключении
+        requestAllNodesStatus();
+    }
+    else if (type == WS_EVT_DISCONNECT) {
+        Serial.printf("❌ Клиент отключен: %u\n", client->id());
     }
     else if (type == WS_EVT_DATA) {
         StaticJsonDocument<200> doc;
@@ -1220,6 +1338,9 @@ void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
             }
             
             if (targetMac) {
+                if (cmd == "GET_STATUS") {
+                    Serial.printf("📡 Запрос статуса узла #%d\n", targetNode);
+                }
                 sendToNode(targetMac, cmd);
             }
         }
@@ -1235,7 +1356,11 @@ void sendToNode(uint8_t* mac, String cmd) {
     esp_now_send(mac, (uint8_t*)&outgoingMessage, sizeof(outgoingMessage));
 }
 
-void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
+void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    if (status != ESP_NOW_SEND_SUCCESS) {
+        // Можно добавить логирование ошибок отправки, но не обязательно
+    }
+}
 
 void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len) {
     // Проверяем, от какого узла пришли данные
@@ -1255,6 +1380,7 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
     }
 }
 
+// ИСПРАВЛЕНО: добавлена обработка типа "gpio" для обновления статуса LED
 void processNodeData(const uint8_t *data, int len, int nodeIndex) {
     if (len > sizeof(incomingMessage)) {
         Serial.println("❌ Пакет слишком большой!");
@@ -1290,13 +1416,18 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         String json;
         serializeJson(resp, json);
         ws.textAll(json);
+        
+        Serial.printf("📊 Получены данные от узла #%d\n", nodeId);
     }
     else if (strcmp(type, "security") == 0) {
         bool alarm = doc["alarm"];
         bool c1 = doc["contact1"];
         bool c2 = doc["contact2"];
         
-        // Локальная тревога для узла #102
+        // Сохраняем статус для глобальной тревоги
+        nodeAlarmState[nodeIndex] = alarm;
+        
+        // Локальная тревога для узла #102 (оставляем как есть)
         if (alarm && !securityAlarmActive && nodeId == 102) {
             securityAlarmActive = true;
             alarmStartTime = millis();
@@ -1304,6 +1435,9 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         } else if (!alarm && nodeId == 102) {
             securityAlarmActive = false;
         }
+        
+        // Проверяем глобальную тревогу
+        checkGlobalAlarm();
         
         StaticJsonDocument<200> resp;
         resp["type"] = "security";
@@ -1314,6 +1448,8 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         String json;
         serializeJson(resp, json);
         ws.textAll(json);
+        
+        Serial.printf("🔒 Обновление охраны узла #%d: alarm=%d\n", nodeId, alarm);
     }
     else if (strcmp(type, "ack") == 0) {
         const char* cmd = doc["command"];
@@ -1325,6 +1461,12 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
             String json;
             serializeJson(resp, json);
             ws.textAll(json);
+            
+            // Сохраняем статус LED
+            nodeLedState[nodeIndex] = true;
+            nodeLedKnown[nodeIndex] = true;
+            
+            Serial.printf("💡 Узел #%d подтвердил включение LED\n", nodeId);
         }
         else if (strcmp(cmd, "LED_OFF") == 0) {
             StaticJsonDocument<200> resp;
@@ -1334,6 +1476,12 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
             String json;
             serializeJson(resp, json);
             ws.textAll(json);
+            
+            // Сохраняем статус LED
+            nodeLedState[nodeIndex] = false;
+            nodeLedKnown[nodeIndex] = true;
+            
+            Serial.printf("💡 Узел #%d подтвердил выключение LED\n", nodeId);
         }
     }
     else if (strcmp(type, "gpio") == 0) {
@@ -1343,7 +1491,15 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         if (doc.containsKey("pin") && doc.containsKey("state")) {
             int pin = doc["pin"];
             int state = doc["state"];
-            if (pin == 8) resp["gpio8"] = state;
+            if (pin == 8) {
+                resp["gpio8"] = state;
+                
+                // Сохраняем статус LED
+                nodeLedState[nodeIndex] = (state == 1);
+                nodeLedKnown[nodeIndex] = true;
+                
+                Serial.printf("💡 Узел #%d GPIO8 = %d\n", nodeId, state);
+            }
         }
         String json;
         serializeJson(resp, json);
@@ -1359,6 +1515,8 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
                 processEncoderData(angle, true);
                 updateHistory(angle);
             }
+            
+            Serial.printf("🌪️ Энкодер узла #%d: угол=%.1f°, магнит=%d\n", nodeId, angle, magnet);
         }
     }
 }
@@ -1389,6 +1547,8 @@ void processGreenhouseData(const uint8_t *data) {
     String json;
     serializeJson(resp, json);
     ws.textAll(json);
+    
+    Serial.println("🌿 Данные теплицы обновлены");
 }
 
 String relayStateToString(uint32_t state) {
@@ -1489,4 +1649,7 @@ void broadcastEncoderData() {
     String json;
     serializeJson(doc, json);
     ws.textAll(json);
+    
+    Serial.printf("🌪️ Отправлены данные ветра: напр=%.1f°, сектор=%.1f°, стабильность=%s\n",
+                  windDirection, windCurrentSector, stability.c_str());
 }
