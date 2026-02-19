@@ -1,6 +1,6 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
- * ВЕРСИЯ 6.6: ПОЛНОЦЕННАЯ МЕТЕОСТАНЦИЯ С ПРОГНОЗОМ
+ * ВЕРСИЯ 6.9: ПОЛНОЦЕННАЯ МЕТЕОСТАНЦИЯ С ПРОГНОЗОМ
  * - Прогноз по давлению (метод Zambretti)
  * - Риск заморозков (метод Броунова)
  * - Тренды давления и температуры
@@ -10,6 +10,8 @@
  * - RTC часы
  * - Кнопки управления
  * - Зуммер
+ * - Компас
+ * - Иконки погоды заменены на текст (без артефактов)
  */
 
 #include <WiFi.h>
@@ -64,7 +66,7 @@ SPIClass sdSPI = SPIClass(HSPI);
 // ========== КОНФИГУРАЦИЯ ХАБА ==========
 const char* AP_SSID = "SmartHome-Hub";
 const char* AP_PASSWORD = "12345678";
-const char* HUB_VERSION = "6.6";
+const char* HUB_VERSION = "6.9";
 const char* NODE_VERSION = "2.1";
 
 // MAC адреса узлов
@@ -256,6 +258,7 @@ void calculatePressureTrends();
 String generateForecast(float pressure, float trend, float humidity, int month);
 String checkFrostRisk(float temp, int hour, int month);
 String getWeatherIcon(String forecast);
+String getWeatherText(String icon);
 void broadcastWeatherData();
 void initDisplay();
 void initRTC();
@@ -277,8 +280,8 @@ void checkHTMLFile();
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 6.6) ===");
-    Serial.println("=== С РУССКИМ ДИСПЛЕЕМ, SD, RTC, КНОПКАМИ, ЗУМЕРОМ ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 6.9) ===");
+    Serial.println("=== С ТЕКСТОВЫМИ ИКОНКАМИ ПОГОДЫ ===");
 
     // Инициализация пинов и периферии
     pinMode(TFT_LED, OUTPUT);
@@ -518,7 +521,7 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         
         Serial.printf("Данные узла #%d: T=%.1f, P=%.1f, H=%.0f\n", nodeId, temp, press, hum);
         
-        // Обновляем компас если текущая страница - метеостанция
+        // Обновляем страницу метеостанции при новых данных
         if (currentPage == PAGE_WEATHER) {
             displayWeatherPage();
         }
@@ -652,11 +655,6 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         
         if (displayIndex >= 0 && displayIndex < 4) {
             nodeDisplayData[displayIndex].wind_sector = windCurrentSector;
-        }
-        
-        // Обновляем компас на странице метеостанции при новых данных энкодера
-        if (currentPage == PAGE_WEATHER) {
-            displayWeatherPage();
         }
     }
 }
@@ -845,6 +843,20 @@ String getWeatherIcon(String forecast) {
     return "☀️";
 }
 
+String getWeatherText(String icon) {
+    if (icon == "☀️") return "SOLNCE";
+    if (icon == "🌤️") return "MALO SOLN";
+    if (icon == "⛅") return "OBL SOLN";
+    if (icon == "🌥️") return "OBLACHNO";
+    if (icon == "☁️") return "OBLACHNO";
+    if (icon == "☁️☁️") return "PASMURNO";
+    if (icon == "🌧️") return "DOZHD";
+    if (icon == "⛈️") return "GROZA";
+    if (icon == "❄️") return "SNEG";
+    if (icon == "🌨️") return "SNEGOPAD";
+    return "---";
+}
+
 String checkFrostRisk(float temp, int hour, int month) {
     if (month < 4 || month > 9) return "❄️ Seasonal";
     
@@ -1024,7 +1036,7 @@ void initDisplay() {
     tft.setCursor(20, 50);
     tft.print("SmartHome Hub");
     tft.setCursor(20, 70);
-    tft.print("Version 6.6");
+    tft.print("Version 6.9");
     delay(2000);
     tft.fillScreen(ST77XX_BLACK);
     Serial.println("OK");
@@ -1139,12 +1151,12 @@ String formatTime(int value) {
 }
 
 void drawTimeBar() {
-    uint16_t barColor = securityAlarmActive ? ST77XX_RED : ST77XX_GREEN;
+    uint16_t barColor = securityAlarmActive ? ST77XX_BLUE : ST77XX_GREEN;
     
     if (!rtcOK) {
         tft.fillRect(0, 0, 160, 15, barColor);
         tft.setCursor(5, 3);
-        tft.setTextColor(ST77XX_BLUE);
+        tft.setTextColor(ST77XX_RED);
         tft.print(rusToEng("RTC OSHIBKA"));
         return;
     }
@@ -1159,14 +1171,14 @@ void drawTimeBar() {
     
     tft.fillRect(0, 0, 160, 15, barColor);
     tft.setCursor(5, 3);
-    tft.setTextColor(ST77XX_BLUE);
+    tft.setTextColor(ST77XX_RED);
     tft.print(timeStr);
     
     tft.setCursor(60, 3);
     tft.print(dateStr);
     
     tft.setCursor(140, 3);
-    tft.setTextColor(sdInitialized ? ST77XX_BLUE : ST77XX_RED);
+    tft.setTextColor(sdInitialized ? ST77XX_RED : ST77XX_BLUE);
     tft.print(sdInitialized ? "SD" : "NO");
 }
 
@@ -1197,25 +1209,40 @@ void displayWeatherPage() {
     tft.print(currentHumidity, 0);
     tft.print("%");
     
-    tft.setCursor(5, 85);
+    tft.setCursor(5, 80);
+    tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Prognoz:"));
     tft.setCursor(5, 97);
     tft.setTextColor(ST77XX_YELLOW);
-    tft.print(shortForecast);
     
-    tft.setCursor(120, 85);
-    tft.setTextSize(2);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.print(weatherIcon);
-    tft.setTextSize(1);
+    String forecast = shortForecast;
+    if (forecast.length() > 15) {
+        forecast = forecast.substring(0, 8) + "...";
+    }
+    tft.print(forecast);
+    
+    // Текстовая иконка погоды вместо графической
+    tft.setCursor(100, 80);
+    tft.setTextColor(ST77XX_CYAN);
+    tft.print(getWeatherText(weatherIcon));
     
     tft.setCursor(5, 115);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Zamorozki: "));
-    if (frostRisk.indexOf("High") >= 0) tft.setTextColor(ST77XX_RED);
-    else if (frostRisk.indexOf("Medium") >= 0) tft.setTextColor(ST77XX_ORANGE);
-    else tft.setTextColor(ST77XX_GREEN);
-    tft.print(frostRisk);
+    
+    if (frostRisk.indexOf("High") >= 0) {
+        tft.setTextColor(ST77XX_BLUE);
+    } else if (frostRisk.indexOf("Medium") >= 0) {
+        tft.setTextColor(ST77XX_ORANGE);
+    } else {
+        tft.setTextColor(ST77XX_GREEN);
+    }
+    
+    String frost = frostRisk;
+    if (frost.length() > 10) {
+        frost = frost.substring(0, 10);
+    }
+    tft.print(frost);
     
     draw_compass(120, 115, 18, windDirection, windCurrentSector, windMagnet);
 }
@@ -1226,12 +1253,12 @@ void displayNodePage() {
     NodeDisplayData &node = nodeDisplayData[displayNodeIndex];
     
     if (!node.connected) {
-        tft.fillRect(0, 18, 160, 12, ST77XX_RED);
+        tft.fillRect(0, 18, 160, 12, ST77XX_BLUE);
         tft.setCursor(5, 20);
         tft.setTextColor(ST77XX_WHITE);
         tft.print(rusToEng("NET SVYAZI!"));
     } else if (node.alarm) {
-        tft.fillRect(0, 18, 160, 12, alarmBlinkState ? ST77XX_RED : ST77XX_BLUE);
+        tft.fillRect(0, 18, 160, 12, alarmBlinkState ? ST77XX_BLUE : ST77XX_GREEN);
         tft.setCursor(5, 20);
         tft.setTextColor(ST77XX_WHITE);
         tft.print(rusToEng("TREVOGA!"));
@@ -1268,14 +1295,31 @@ void displayNodePage() {
     tft.setTextColor(ST77XX_WHITE);
     tft.print("LED: ");
     if (node.led_state) {
-        tft.setTextColor(ST77XX_RED);
+        tft.setTextColor(ST77XX_BLUE);
         tft.print("ON");
     } else {
         tft.setTextColor(ST77XX_GREEN);
         tft.print("OFF");
     }
     
-    tft.fillRect(0, 150, 160, 10, ST77XX_BLUE);
+    if (node.id == 102 && node.connected) {
+        draw_compass(110, 105, 18, node.wind_angle, node.wind_sector, node.magnet);
+        
+        tft.setCursor(5, yOffset + 60);
+        tft.setTextColor(ST77XX_WHITE);
+        tft.print(rusToEng("Veter: "));
+        tft.print(node.wind_angle, 0);
+        tft.print("° ±");
+        tft.print(node.wind_sector, 0);
+        tft.print("°");
+        
+        tft.setCursor(5, yOffset + 72);
+        tft.print(rusToEng("Magnit: "));
+        tft.setTextColor(node.magnet ? ST77XX_GREEN : ST77XX_BLUE);
+        tft.print(node.magnet ? "OK" : "NO");
+    }
+    
+    tft.fillRect(0, 150, 160, 10, ST77XX_GREEN);
     tft.setCursor(50, 152);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Uzel "));
@@ -1292,7 +1336,7 @@ void displaySDPage() {
     
     if (!sdInitialized) {
         tft.setCursor(5, 40);
-        tft.setTextColor(ST77XX_RED);
+        tft.setTextColor(ST77XX_BLUE);
         tft.print(rusToEng("OSHI BKA: "));
         tft.print(sdErrorMsg);
         return;
@@ -1356,10 +1400,10 @@ void draw_compass(int cx, int cy, int r, float angle, float sector, bool magnet)
     tft.drawCircle(cx, cy, r, ST77XX_BLACK);
     
     if (!magnet) {
-        tft.drawLine(cx - r, cy - r, cx + r, cy + r, ST77XX_RED);
-        tft.drawLine(cx - r, cy + r, cx + r, cy - r, ST77XX_RED);
+        tft.drawLine(cx - r, cy - r, cx + r, cy + r, ST77XX_BLUE);
+        tft.drawLine(cx - r, cy + r, cx + r, cy - r, ST77XX_BLUE);
         tft.setCursor(cx - 8, cy - 3);
-        tft.setTextColor(ST77XX_RED);
+        tft.setTextColor(ST77XX_BLUE);
         tft.print("NO");
         return;
     }
@@ -1380,7 +1424,7 @@ void draw_compass(int cx, int cy, int r, float angle, float sector, bool magnet)
         for (float a = start_rad; a <= end_rad; a += 0.03) {
             int x1 = cx + r * cos(a);
             int y1 = cy + r * sin(a);
-            tft.drawPixel(x1, y1, ST77XX_RED);
+            tft.drawPixel(x1, y1, ST77XX_BLUE);
         }
     }
     
@@ -1388,7 +1432,7 @@ void draw_compass(int cx, int cy, int r, float angle, float sector, bool magnet)
     int x_end = cx + (r-4) * cos(arrow_rad);
     int y_end = cy + (r-4) * sin(arrow_rad);
     tft.drawLine(cx, cy, x_end, y_end, ST77XX_BLACK);
-    tft.fillCircle(cx, cy, 2, ST77XX_RED);
+    tft.fillCircle(cx, cy, 2, ST77XX_BLUE);
 }
 
 void handleButtons() {
