@@ -1,12 +1,15 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
- * ВЕРСИЯ 6.3: ПОЛНОЦЕННАЯ МЕТЕОСТАНЦИЯ С ПРОГНОЗОМ
+ * ВЕРСИЯ 6.6: ПОЛНОЦЕННАЯ МЕТЕОСТАНЦИЯ С ПРОГНОЗОМ
  * - Прогноз по давлению (метод Zambretti)
  * - Риск заморозков (метод Броунова)
  * - Тренды давления и температуры
  * - Визуальные индикаторы на веб-странице
- * 
- * ДОПОЛНЕНО: Дисплей, SD карта, RTC, кнопки, зуммер (НЕ ИЗМЕНЯЯ ОСНОВНУЮ ЛОГИКУ)
+ * - Дисплей с русскими надписями (транслит)
+ * - SD карта для хранения HTML
+ * - RTC часы
+ * - Кнопки управления
+ * - Зуммер
  */
 
 #include <WiFi.h>
@@ -16,7 +19,7 @@
 #include <ArduinoJson.h>
 #include <math.h>
 
-// ==================== НОВЫЕ БИБЛИОТЕКИ (ТОЛЬКО ДОБАВЛЕНИЕ) ====================
+// ========== БИБЛИОТЕКИ ДЛЯ ПЕРИФЕРИИ ==========
 #include <SPI.h>
 #include <Wire.h>
 #include <SD.h>
@@ -25,8 +28,10 @@
 #include <Adafruit_ST7735.h>
 #include <RTClib.h>
 
-// ==================== НОВЫЕ ПИНЫ (ТОЛЬКО ДОБАВЛЕНИЕ) ====================
-// Дисплей (VSPI)
+// ========== РУССКИЙ ТРАНСЛИТ ==========
+#include "rus_font.h"
+
+// ========== ПИНЫ ДИСПЛЕЯ (VSPI) ==========
 #define TFT_CS    5
 #define TFT_DC    27
 #define TFT_RST   4
@@ -34,79 +39,53 @@
 #define TFT_SCK   18
 #define TFT_MOSI  23
 
-// SD карта (HSPI)
+// ========== ПИНЫ SD КАРТЫ (HSPI) ==========
 #define SD_CS     15
 #define SD_MOSI   13
 #define SD_MISO   12
 #define SD_SCK    14
 
-// RTC (I2C)
+// ========== ПИНЫ RTC (I2C) ==========
 #define RTC_SDA   21
 #define RTC_SCL   22
 
-// Кнопки и зумер
+// ========== ПИНЫ КНОПОК И ЗУМЕРА ==========
 #define BTN_CYCLE 17
 #define BTN_ENTER 16
 #define BUZZER_PIN 25
 #define BUZZER_CHANNEL 0
 
-// ==================== НОВЫЕ ОБЪЕКТЫ (ТОЛЬКО ДОБАВЛЕНИЕ) ====================
+// ========== ОБЪЕКТЫ ПЕРИФЕРИИ ==========
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
 RTC_DS1307 rtc;
 SPIClass tftSPI = SPIClass(VSPI);
 SPIClass sdSPI = SPIClass(HSPI);
 
-// ==================== НОВЫЕ ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ (ТОЛЬКО ДОБАВЛЕНИЕ) ====================
-// Для дисплея
-bool displayEnabled = true;
-unsigned long lastDisplayUpdate = 0;
-const unsigned long DISPLAY_UPDATE_INTERVAL = 500;
-int displayNodeIndex = 0;
-bool alarmBlinkState = false;
-unsigned long lastBlinkTime = 0;
+// ========== КОНФИГУРАЦИЯ ХАБА ==========
+const char* AP_SSID = "SmartHome-Hub";
+const char* AP_PASSWORD = "12345678";
+const char* HUB_VERSION = "6.6";
+const char* NODE_VERSION = "2.1";
 
-// Для RTC
-bool rtcOK = false;
-DateTime lastRTCRead;
-uint32_t lastRTCReadTime = 0;
-const uint32_t RTC_READ_INTERVAL = 500;
-char timeStr[20];
-char dateStr[20];
+// MAC адреса узлов
+uint8_t node102MacAddress[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
+uint8_t node103MacAddress[] = {0x88, 0x56, 0xA6, 0x7D, 0x09, 0x64};
+uint8_t node104MacAddress[] = {0x10, 0x00, 0x3B, 0xB1, 0xA6, 0x9C};
+uint8_t node105MacAddress[] = {0x88, 0x56, 0xA6, 0x7C, 0xF2, 0xA8};
+uint8_t greenhouseMac[] = {0xE8, 0x9F, 0x6D, 0x87, 0x34, 0x8A};
 
-// Для SD карты
-bool sdInitialized = false;
-uint32_t sdWriteCount = 0;
-uint32_t lastSDWrite = 0;
-const uint32_t SD_WRITE_INTERVAL = 60000;
-uint64_t sdTotalBytes = 0;
-uint64_t sdUsedBytes = 0;
-uint8_t sdCardType = 0;
-char sdErrorMsg[32] = "";
+#define NODE_COUNT 4
+uint8_t* nodeMacs[NODE_COUNT] = {node102MacAddress, node103MacAddress, node104MacAddress, node105MacAddress};
+int nodeNumbers[NODE_COUNT] = {102, 103, 104, 105};
 
-// Для кнопок
-bool lastBtnCycle = HIGH;
-bool lastBtnEnter = HIGH;
-unsigned long lastDebounceCycle = 0;
-unsigned long lastDebounceEnter = 0;
-unsigned long enterPressStart = 0;
-bool enterLongPressHandled = false;
-const unsigned long DEBOUNCE_DELAY = 100;
-const unsigned long LONG_PRESS_MS = 1000;
+// Данные узлов
+unsigned long lastNodeDataTime[NODE_COUNT] = {0, 0, 0, 0};
+const unsigned long NODE_TIMEOUT_MS = 70000;
+bool nodeConnectionLost[NODE_COUNT] = {false, false, false, false};
+unsigned long connectionLostTime[NODE_COUNT] = {0, 0, 0, 0};
+bool nodeAlarmState[NODE_COUNT] = {false, false, false, false};
 
-// Для зумера
-unsigned long lastBuzzerToggle = 0;
-bool buzzerState = false;
-
-// Управление страницами дисплея
-enum DisplayPage {
-    PAGE_WEATHER,
-    PAGE_NODE_INFO,
-    PAGE_SD_MONITOR,
-    PAGE_COUNT
-};
-DisplayPage currentPage = PAGE_WEATHER;
-
-// Данные узлов для дисплея
+// ========== ДАННЫЕ УЗЛОВ ДЛЯ ДИСПЛЕЯ ==========
 struct NodeDisplayData {
     int id;
     float temp;
@@ -125,69 +104,12 @@ struct NodeDisplayData {
     {105, 0, 0, 0, false, false, false, 0, 0, false}
 };
 
-// ==================== ПРОТОТИПЫ НОВЫХ ФУНКЦИЙ ====================
-void initDisplay();
-void initRTC();
-void initSD();
-void updateSDInfo();
-void displayWeatherPage();
-void displayNodePage();
-void displaySDPage();
-void drawTimeBar();
-void draw_compass(int cx, int cy, int r, float angle, float sector, bool magnet);
-void handleButtons();
-void buzzerBeep(int durationMs);
-void updateAlarmSound();
-String formatTime(int value);
-void testSDWrite();
-void checkHTMLFile();
-
-// ---- 1. КОНФИГУРАЦИЯ (БЕЗ ИЗМЕНЕНИЙ) ----
-const char* AP_SSID = "SmartHome-Hub";
-const char* AP_PASSWORD = "12345678";
-
-// Версии прошивок
-const char* HUB_VERSION = "6.0";
-const char* NODE_VERSION = "2.1";
-
-// MAC адреса узлов
-uint8_t node102MacAddress[] = {0xAC, 0xEB, 0xE6, 0x49, 0x10, 0x28};
-uint8_t node103MacAddress[] = {0x88, 0x56, 0xA6, 0x7D, 0x09, 0x64};
-uint8_t node104MacAddress[] = {0x10, 0x00, 0x3B, 0xB1, 0xA6, 0x9C};
-uint8_t node105MacAddress[] = {0x88, 0x56, 0xA6, 0x7C, 0xF2, 0xA8};
-
-// MAC устройства "Теплица"
-uint8_t greenhouseMac[] = {0xE8, 0x9F, 0x6D, 0x87, 0x34, 0x8A};
-
-// Массив всех узлов
-#define NODE_COUNT 4
-uint8_t* nodeMacs[NODE_COUNT] = {
-    node102MacAddress,
-    node103MacAddress,
-    node104MacAddress,
-    node105MacAddress
-};
-
-int nodeNumbers[NODE_COUNT] = {102, 103, 104, 105};
-
-// Время последнего получения данных
-unsigned long lastNodeDataTime[NODE_COUNT] = {0, 0, 0, 0};
-const unsigned long NODE_TIMEOUT_MS = 70000;
-
-// Флаги потери связи
-bool nodeConnectionLost[NODE_COUNT] = {false, false, false, false};
-unsigned long connectionLostTime[NODE_COUNT] = {0, 0, 0, 0};
-
-// Статусы тревог для каждого узла
-bool nodeAlarmState[NODE_COUNT] = {false, false, false, false};
-
-// ---- 2. УНИВЕРСАЛЬНАЯ СТРУКТУРА ESP-NOW ----
+// ========== ESP-NOW СТРУКТУРЫ ==========
 typedef struct esp_now_message {
     char json[192];
     uint8_t sender_id;
 } esp_now_message;
 
-// ---- 3. СТРУКТУРА ДАННЫХ ТЕПЛИЦЫ ----
 #pragma pack(push, 1)
 typedef struct greenhouse_packet {
     char temp_in[4];
@@ -202,7 +124,7 @@ typedef struct greenhouse_packet {
 } greenhouse_packet;
 #pragma pack(pop)
 
-// ---- 4. ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ----
+// ========== ГЛОБАЛЬНЫЕ ОБЪЕКТЫ ==========
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 esp_now_message outgoingMessage;
@@ -210,12 +132,11 @@ esp_now_message incomingMessage;
 
 unsigned long lastGreenhouseUpdate = 0;
 const unsigned long GREENHOUSE_UPDATE_INTERVAL = 30000;
-
 bool securityAlarmActive = false;
 unsigned long alarmStartTime = 0;
 const unsigned long ALARM_DURATION_MS = 10000;
 
-// ---- 5. ДАННЫЕ ЭНКОДЕРА AS5600 - УЛУЧШЕННЫЙ АЛГОРИТМ ----
+// ========== ДАННЫЕ ЭНКОДЕРА ==========
 #define ENCODER_HISTORY_SIZE 60
 #define ENCODER_BROADCAST_INTERVAL 5000
 #define HISTORY_PERIOD_MS 60000
@@ -225,30 +146,26 @@ float currentEncoderAngle = -1.0;
 float windDirection = 0.0;
 float windCurrentSector = 0.0;
 bool windMagnet = false;
-
 float encoderHistory[ENCODER_HISTORY_SIZE];
 unsigned long historyTimestamps[ENCODER_HISTORY_SIZE];
 int historyIndex = 0;
 int historyCount = 0;
-
 float maxSectorStart = 0.0;
 float maxSectorEnd = 0.0;
 float maxSectorWidth = 0.0;
 unsigned long maxSectorTimestamp = 0;
-
 float currentSectorStart = 0.0;
 float currentSectorEnd = 0.0;
-
 unsigned long lastEncoderBroadcastTime = 0;
 
-// ---- 6. ДАННЫЕ МЕТЕОСТАНЦИИ И ПРОГНОЗА ----
-#define PRESSURE_HISTORY_SIZE 48        // 48 значений = 24 часа при 30 мин
-#define FROST_CHECK_HOUR 21              // 21:00 - время проверки заморозков
+// ========== ДАННЫЕ МЕТЕОСТАНЦИИ ==========
+#define PRESSURE_HISTORY_SIZE 48
+#define FROST_CHECK_HOUR 21
 
 struct WeatherData {
-    float pressure;        // мм рт.ст.
-    float temperature;     // °C
-    float humidity;        // %
+    float pressure;
+    float temperature;
+    float humidity;
     unsigned long timestamp;
 };
 
@@ -256,27 +173,71 @@ WeatherData weatherHistory[PRESSURE_HISTORY_SIZE];
 int weatherIndex = 0;
 int weatherCount = 0;
 
-// Текущие значения
 float currentPressure = 0;
 float currentTemp = 0;
 float currentHumidity = 0;
+float pressureTrend3h = 0;
+float pressureTrend6h = 0;
+float pressureTrend12h = 0;
+float tempTrend3h = 0;
 
-// Тренды
-float pressureTrend3h = 0;    // мм рт.ст./3 часа
-float pressureTrend6h = 0;    // мм рт.ст./6 часов
-float pressureTrend12h = 0;   // мм рт.ст./12 часов
-float tempTrend3h = 0;        // °C/3 часа
-
-// Прогнозы
 String shortForecast = "---";
 String frostRisk = "---";
 String weatherIcon = "☀️";
 unsigned long lastForecastUpdate = 0;
-const unsigned long FORECAST_UPDATE_INTERVAL = 1800000; // 30 минут
+const unsigned long FORECAST_UPDATE_INTERVAL = 1800000;
 
-// ---- 7. ПРОТОТИПЫ (БЕЗ ИЗМЕНЕНИЙ) ----
-void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
-                     AwsEventType type, void *arg, uint8_t *data, size_t len);
+// ========== ПЕРЕМЕННЫЕ ДЛЯ ДИСПЛЕЯ ==========
+int displayNodeIndex = 0;
+const int NODE_COUNT_DISP = 4;
+bool alarmBlinkState = false;
+unsigned long lastBlinkTime = 0;
+unsigned long lastDisplayUpdate = 0;
+const unsigned long DISPLAY_UPDATE_INTERVAL = 500;
+
+// ========== ПЕРЕМЕННЫЕ ДЛЯ RTC ==========
+bool rtcOK = false;
+DateTime lastRTCRead;
+uint32_t lastRTCReadTime = 0;
+const uint32_t RTC_READ_INTERVAL = 500;
+char timeStr[20];
+char dateStr[20];
+
+// ========== ПЕРЕМЕННЫЕ ДЛЯ SD КАРТЫ ==========
+bool sdInitialized = false;
+uint32_t sdWriteCount = 0;
+uint32_t lastSDWrite = 0;
+const uint32_t SD_WRITE_INTERVAL = 60000;
+uint64_t sdTotalBytes = 0;
+uint64_t sdUsedBytes = 0;
+uint8_t sdCardType = 0;
+char sdErrorMsg[32] = "";
+
+// ========== ПЕРЕМЕННЫЕ ДЛЯ ЗУМЕРА ==========
+unsigned long lastBuzzerToggle = 0;
+bool buzzerState = false;
+
+// ========== УПРАВЛЕНИЕ СТРАНИЦАМИ ==========
+enum DisplayPage {
+    PAGE_WEATHER,
+    PAGE_NODE_INFO,
+    PAGE_SD_MONITOR,
+    PAGE_COUNT
+};
+DisplayPage currentPage = PAGE_WEATHER;
+
+// ========== СОСТОЯНИЯ КНОПОК ==========
+bool lastBtnCycle = HIGH;
+bool lastBtnEnter = HIGH;
+unsigned long lastDebounceCycle = 0;
+unsigned long lastDebounceEnter = 0;
+unsigned long enterPressStart = 0;
+bool enterLongPressHandled = false;
+const unsigned long DEBOUNCE_DELAY = 100;
+const unsigned long LONG_PRESS_MS = 1000;
+
+// ========== ПРОТОТИПЫ ==========
+void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len);
 void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
 void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
 void sendToNode(uint8_t* mac, String cmd);
@@ -296,28 +257,30 @@ String generateForecast(float pressure, float trend, float humidity, int month);
 String checkFrostRisk(float temp, int hour, int month);
 String getWeatherIcon(String forecast);
 void broadcastWeatherData();
+void initDisplay();
+void initRTC();
+void initSD();
+void updateSDInfo();
+void displayWeatherPage();
+void displayNodePage();
+void displaySDPage();
+void drawTimeBar();
+void draw_compass(int cx, int cy, int r, float angle, float sector, bool magnet);
+void handleButtons();
+void buzzerBeep(int durationMs);
+void updateAlarmSound();
+String formatTime(int value);
+void testSDWrite();
+void checkHTMLFile();
 
-// ===================== SETUP (ДОПОЛНЕН БЕЗ ИЗМЕНЕНИЙ) =====================
+// ===================== SETUP =====================
 void setup() {
     Serial.begin(115200);
-    Serial.println("✅ Веб-сервер запущен, HTML код загружен");
     delay(1000);
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 6.6) ===");
+    Serial.println("=== С РУССКИМ ДИСПЛЕЕМ, SD, RTC, КНОПКАМИ, ЗУМЕРОМ ===");
 
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 6.0) ===");
-    Serial.println("=== ПОЛНОЦЕННАЯ МЕТЕОСТАНЦИЯ С ПРОГНОЗОМ ===");
-
-    // ИНИЦИАЛИЗАЦИЯ
-    historyCount = 0;
-    historyIndex = 0;
-    lastEncoderBroadcastTime = 0;
-    maxSectorWidth = 0.0;
-    maxSectorTimestamp = 0;
-    
-    weatherCount = 0;
-    weatherIndex = 0;
-    lastForecastUpdate = 0;
-
-    // ========== ИНИЦИАЛИЗАЦИЯ НОВОЙ ПЕРИФЕРИИ ==========
+    // Инициализация пинов и периферии
     pinMode(TFT_LED, OUTPUT);
     digitalWrite(TFT_LED, HIGH);
     
@@ -331,42 +294,43 @@ void setup() {
     initDisplay();
     initRTC();
     initSD();
-    checkHTMLFile(); 
+    checkHTMLFile();
     
     buzzerBeep(100);
     delay(100);
     buzzerBeep(100);
-    // ==================================================
+
+    // Инициализация WiFi и ESP-NOW
+    historyCount = 0;
+    historyIndex = 0;
+    lastEncoderBroadcastTime = 0;
+    maxSectorWidth = 0.0;
+    weatherCount = 0;
+    weatherIndex = 0;
+    lastForecastUpdate = 0;
 
     WiFi.mode(WIFI_AP);
-    if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) {
-        Serial.println("❌ Ошибка создания точки доступа!");
-        while(1) delay(1000);
-    }
+    WiFi.softAP(AP_SSID, AP_PASSWORD);
     Serial.print("IP адрес: ");
     Serial.println(WiFi.softAPIP());
 
-   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    if (sdInitialized && SD.exists("/index.html")) {
-        request->send(SD, "/index.html", "text/html");
-        Serial.println("📄 HTML загружен с SD карты");
-    } else {
-        request->send(200, "text/html", "<h1>SD Card Error</h1><p>HTML file not found</p>");
-        Serial.println("❌ HTML файл не найден на SD");
-    }
-});
+    // ========== ВЕБ-СЕРВЕР ==========
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (sdInitialized && SD.exists("/index.html")) {
+            request->send(SD, "/index.html", "text/html");
+            Serial.println("📄 HTML загружен с SD карты");
+        } else {
+            request->send(200, "text/html", "<h1>SD Card Error</h1><p>HTML file not found</p>");
+            Serial.println("❌ HTML файл не найден на SD");
+        }
+    });
 
     ws.onEvent(onWebSocketEvent);
     server.addHandler(&ws);
     server.begin();
-    Serial.println("✅ Веб-сервер и WebSocket запущены.");
 
     WiFi.mode(WIFI_AP_STA);
-    if (esp_now_init() != ESP_OK) {
-        Serial.println("❌ Ошибка инициализации ESP-NOW!");
-        while(1) delay(1000);
-    }
-
+    esp_now_init();
     esp_now_register_send_cb(onEspNowDataSent);
     esp_now_register_recv_cb(onEspNowDataRecv);
 
@@ -375,49 +339,35 @@ void setup() {
         memcpy(peerInfo.peer_addr, nodeMacs[i], 6);
         peerInfo.channel = 0;
         peerInfo.encrypt = false;
-        if (esp_now_add_peer(&peerInfo) != ESP_OK) {
-            Serial.printf("❌ Не удалось добавить узел #%d!\n", nodeNumbers[i]);
-        } else {
-            Serial.printf("✅ Узел #%d добавлен.\n", nodeNumbers[i]);
-        }
+        esp_now_add_peer(&peerInfo);
     }
 
     esp_now_peer_info_t greenhousePeerInfo = {};
     memcpy(greenhousePeerInfo.peer_addr, greenhouseMac, 6);
     greenhousePeerInfo.channel = 0;
     greenhousePeerInfo.encrypt = false;
-    if (esp_now_add_peer(&greenhousePeerInfo) != ESP_OK) {
-        Serial.println("❌ Не удалось добавить теплицу!");
-    } else {
-        Serial.println("✅ Теплица добавлена.");
-    }
+    esp_now_add_peer(&greenhousePeerInfo);
 
     Serial.println("\n=== ХАБ ГОТОВ К РАБОТЕ ===");
-    Serial.println("1. Подключитесь к Wi-Fi: " + String(AP_SSID));
-    Serial.println("2. Откройте: http://" + WiFi.softAPIP().toString());
-    Serial.println("3. Ветер: красный - текущий, желтый - максимум за 1 мин");
-    Serial.println("4. Метеостанция: прогноз по Zambretti + заморозки");
-    Serial.println("5. Тревога при потере магнита энкодера");
-    Serial.println("6. Поддерживается 4 узла (ID 102, 103, 104, 105)");
-    Serial.println("7. Версия хаба: 6.0\n");
-    
-    // Отображаем начальную страницу на дисплее
     displayWeatherPage();
 }
 
+// ===================== LOOP =====================
 void loop() {
+    unsigned long now = millis();
+    
+    // Основные функции хаба
     ws.cleanupClients();
     checkNodeConnection();
     updateAlarmState();
     
-    unsigned long now = millis();
     if (now - lastEncoderBroadcastTime >= ENCODER_BROADCAST_INTERVAL) {
         updateMaxMin();
         broadcastEncoderData();
         lastEncoderBroadcastTime = now;
     }
     
-    // ========== НОВЫЕ ФУНКЦИИ В LOOP ==========
+    // Функции периферии
     handleButtons();
     updateAlarmSound();
     
@@ -447,67 +397,19 @@ void loop() {
         lastSDWrite = now;
         testSDWrite();
     }
-    // ==========================================
     
-    delay(100);
+    delay(10);
 }
 
-void sendConnectionStatusToWeb(int nodeIndex, bool connected) {
-    StaticJsonDocument<100> doc;
-    doc["type"] = connected ? "connection_restored" : "connection_lost";
-    doc["node"] = nodeNumbers[nodeIndex];
-    String json;
-    serializeJson(doc, json);
-    ws.textAll(json);
-}
+// ==================== ФУНКЦИИ ESP-NOW ====================
 
-void checkNodeConnection() {
-    unsigned long now = millis();
-    for (int i = 0; i < NODE_COUNT; i++) {
-        if (lastNodeDataTime[i] > 0) {
-            if (now - lastNodeDataTime[i] > NODE_TIMEOUT_MS) {
-                if (!nodeConnectionLost[i]) {
-                    nodeConnectionLost[i] = true;
-                    connectionLostTime[i] = now;
-                    Serial.printf("⚠️ СВЯЗЬ С УЗЛОМ #%d ПОТЕРЯНА!\n", nodeNumbers[i]);
-                    sendConnectionStatusToWeb(i, false);
-                    
-                    // Обновляем данные для дисплея
-                    if (i < 4) {
-                        nodeDisplayData[i].connected = false;
-                    }
-                }
-            } else {
-                if (nodeConnectionLost[i]) {
-                    nodeConnectionLost[i] = false;
-                    Serial.printf("✅ СВЯЗЬ С УЗЛОМ #%d ВОССТАНОВЛЕНА!\n", nodeNumbers[i]);
-                    sendConnectionStatusToWeb(i, true);
-                    
-                    // Обновляем данные для дисплея
-                    if (i < 4) {
-                        nodeDisplayData[i].connected = true;
-                    }
-                }
-            }
-        }
-    }
-}
-
-void updateAlarmState() {
-    if (securityAlarmActive && (millis() - alarmStartTime) > ALARM_DURATION_MS) {
-        securityAlarmActive = false;
-    }
-}
-
-void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
-                     AwsEventType type, void *arg, uint8_t *data, size_t len) {
+void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
     if (type == WS_EVT_CONNECT) {
-        Serial.printf("✅ Новый клиент подключен: %u\n", client->id());
-        // Отправляем текущие данные метеостанции новому клиенту
+        Serial.printf("Новый клиент: %u\n", client->id());
         broadcastWeatherData();
     }
     else if (type == WS_EVT_DISCONNECT) {
-        Serial.printf("❌ Клиент отключен: %u\n", client->id());
+        Serial.printf("Клиент отключен: %u\n", client->id());
     }
     else if (type == WS_EVT_DATA) {
         StaticJsonDocument<200> doc;
@@ -535,7 +437,6 @@ void sendToNode(uint8_t* mac, String cmd) {
     char json_cmd[64];
     snprintf(json_cmd, sizeof(json_cmd), "{\"type\":\"command\",\"command\":\"%s\"}", cmd.c_str());
     strncpy(outgoingMessage.json, json_cmd, sizeof(outgoingMessage.json)-1);
-    outgoingMessage.json[sizeof(outgoingMessage.json)-1] = '\0';
     outgoingMessage.sender_id = 1;
     esp_now_send(mac, (uint8_t*)&outgoingMessage, sizeof(outgoingMessage));
 }
@@ -550,7 +451,6 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
             return;
         }
     }
-    
     if (memcmp(mac_addr, greenhouseMac, 6) == 0) {
         if (len == sizeof(greenhouse_packet)) {
             processGreenhouseData(incomingData);
@@ -559,26 +459,17 @@ void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int 
 }
 
 void processNodeData(const uint8_t *data, int len, int nodeIndex) {
-    if (len > sizeof(incomingMessage)) {
-        Serial.println("❌ Пакет слишком большой!");
-        return;
-    }
-    
+    if (len > sizeof(incomingMessage)) return;
     memcpy(&incomingMessage, data, len);
     
     StaticJsonDocument<256> doc;
     DeserializationError error = deserializeJson(doc, incomingMessage.json);
-    if (error) {
-        Serial.print("❌ JSON ошибка: ");
-        Serial.println(error.c_str());
-        return;
-    }
+    if (error) return;
 
     const char* type = doc["type"];
     int nodeId = nodeNumbers[nodeIndex];
-    
-    // Обновляем данные для дисплея (ТОЛЬКО ДОБАВЛЕНИЕ, БЕЗ ИЗМЕНЕНИЙ)
     int displayIndex = nodeId - 102;
+
     if (displayIndex >= 0 && displayIndex < 4) {
         nodeDisplayData[displayIndex].id = nodeId;
         nodeDisplayData[displayIndex].connected = true;
@@ -586,45 +477,33 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
 
     if (strcmp(type, "sensor") == 0) {
         JsonObject dataObj = doc["data"];
-        
-        // Получаем значения
         float temp = dataObj["AHT20"]["temp"].as<float>();
         float hum = dataObj["AHT20"]["hum"].as<float>();
         float press = dataObj["BMP280"]["press_mmHg"].as<float>();
         
-        // Для узла #102 обновляем данные метеостанции
         if (nodeId == 102) {
             currentPressure = press;
-            currentTemp = temp;
-            currentHumidity = hum;
-            updateWeatherHistory(press, temp, hum);
+            updateWeatherHistory(press, currentTemp, currentHumidity);
         }
         
-        // Обновляем данные для дисплея (ТОЛЬКО ДОБАВЛЕНИЕ)
         if (displayIndex >= 0 && displayIndex < 4) {
             nodeDisplayData[displayIndex].temp = temp;
             nodeDisplayData[displayIndex].hum = hum;
             nodeDisplayData[displayIndex].press = press;
         }
         
-        // Отправляем сенсорные данные
         StaticJsonDocument<500> resp;
         resp["type"] = "sensor_data";
         resp["node"] = nodeId;
-        if (dataObj.containsKey("AHT20")) {
-            resp["aht20"]["temp"] = dataObj["AHT20"]["temp"].as<String>();
-            resp["aht20"]["hum"] = dataObj["AHT20"]["hum"].as<String>();
-        }
-        if (dataObj.containsKey("BMP280")) {
-            resp["bmp280"]["temp"] = dataObj["BMP280"]["temp"].as<String>();
-            resp["bmp280"]["press"] = dataObj["BMP280"]["press_mmHg"].as<String>();
-        }
+        resp["aht20"]["temp"] = dataObj["AHT20"]["temp"].as<String>();
+        resp["aht20"]["hum"] = dataObj["AHT20"]["hum"].as<String>();
+        resp["bmp280"]["temp"] = dataObj["BMP280"]["temp"].as<String>();
+        resp["bmp280"]["press"] = dataObj["BMP280"]["press_mmHg"].as<String>();
         
-        // Добавляем данные метеостанции для узла #102
         if (nodeId == 102) {
             JsonObject weather = resp.createNestedObject("weather_data");
             weather["pressure"] = serialized(String(press, 1));
-            weather["humidity"] = serialized(String(hum, 0));
+            weather["humidity"] = serialized(String(currentHumidity, 0));
             weather["trend3h"] = serialized(String(pressureTrend3h, 1));
             weather["trend6h"] = serialized(String(pressureTrend6h, 1));
             weather["trend12h"] = serialized(String(pressureTrend12h, 1));
@@ -637,17 +516,17 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         serializeJson(resp, json);
         ws.textAll(json);
         
-        Serial.printf("📊 Данные от узла #%d: T=%.1f, P=%.1f, H=%.0f\n", 
-                     nodeId, temp, press, hum);
+        Serial.printf("Данные узла #%d: T=%.1f, P=%.1f, H=%.0f\n", nodeId, temp, press, hum);
+        
+        // Обновляем компас если текущая страница - метеостанция
+        if (currentPage == PAGE_WEATHER) {
+            displayWeatherPage();
+        }
     }
     else if (strcmp(type, "security") == 0) {
         bool alarm = doc["alarm"];
-        bool c1 = doc["contact1"];
-        bool c2 = doc["contact2"];
-        
         nodeAlarmState[nodeIndex] = alarm;
         
-        // Обновляем данные для дисплея (ТОЛЬКО ДОБАВЛЕНИЕ)
         if (displayIndex >= 0 && displayIndex < 4) {
             nodeDisplayData[displayIndex].alarm = alarm;
         }
@@ -655,7 +534,6 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         if (alarm && !securityAlarmActive && nodeId == 102) {
             securityAlarmActive = true;
             alarmStartTime = millis();
-            Serial.println("🚨 ТРЕВОГА (узел #102)!");
         } else if (!alarm && nodeId == 102) {
             securityAlarmActive = false;
         }
@@ -664,18 +542,13 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         resp["type"] = "security";
         resp["node"] = nodeId;
         resp["alarm"] = alarm;
-        resp["contact1"] = c1;
-        resp["contact2"] = c2;
         String json;
         serializeJson(resp, json);
         ws.textAll(json);
-        
-        Serial.printf("🔒 Статус узла #%d: alarm=%d\n", nodeId, alarm);
     }
     else if (strcmp(type, "ack") == 0) {
         const char* cmd = doc["command"];
         if (strcmp(cmd, "LED_ON") == 0) {
-            // Обновляем данные для дисплея (ТОЛЬКО ДОБАВЛЕНИЕ)
             if (displayIndex >= 0 && displayIndex < 4) {
                 nodeDisplayData[displayIndex].led_state = true;
             }
@@ -688,10 +561,14 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
             serializeJson(resp, json);
             ws.textAll(json);
             
-            Serial.printf("💡 Узел #%d LED ON\n", nodeId);
+            Serial.printf("LED ON #%d\n", nodeId);
+            
+            // Обновляем страницу узла
+            if (currentPage == PAGE_NODE_INFO && displayIndex == displayNodeIndex) {
+                displayNodePage();
+            }
         }
         else if (strcmp(cmd, "LED_OFF") == 0) {
-            // Обновляем данные для дисплея (ТОЛЬКО ДОБАВЛЕНИЕ)
             if (displayIndex >= 0 && displayIndex < 4) {
                 nodeDisplayData[displayIndex].led_state = false;
             }
@@ -704,7 +581,12 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
             serializeJson(resp, json);
             ws.textAll(json);
             
-            Serial.printf("💡 Узел #%d LED OFF\n", nodeId);
+            Serial.printf("LED OFF #%d\n", nodeId);
+            
+            // Обновляем страницу узла
+            if (currentPage == PAGE_NODE_INFO && displayIndex == displayNodeIndex) {
+                displayNodePage();
+            }
         }
     }
     else if (strcmp(type, "gpio") == 0) {
@@ -717,61 +599,64 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
             if (pin == 8) {
                 resp["gpio8"] = state;
                 
-                // Обновляем данные для дисплея (ТОЛЬКО ДОБАВЛЕНИЕ)
                 if (displayIndex >= 0 && displayIndex < 4) {
                     nodeDisplayData[displayIndex].led_state = (state == 1);
                 }
                 
-                Serial.printf("💡 Узел #%d GPIO8 = %d\n", nodeId, state);
+                Serial.printf("GPIO8 #%d = %d\n", nodeId, state);
+                
+                // Обновляем страницу узла
+                if (currentPage == PAGE_NODE_INFO && displayIndex == displayNodeIndex) {
+                    displayNodePage();
+                }
             }
         }
         String json;
         serializeJson(resp, json);
         ws.textAll(json);
     }
-    else if (strcmp(type, "encoder") == 0) {
-        if (nodeIndex == 0) {
-            float angle = doc["angle"];
-            bool magnet = doc["magnet"];
+    else if (strcmp(type, "encoder") == 0 && nodeIndex == 0) {
+        float angle = doc["angle"];
+        bool magnet = doc["magnet"];
+        
+        if (displayIndex >= 0 && displayIndex < 4) {
+            nodeDisplayData[displayIndex].wind_angle = angle;
+            nodeDisplayData[displayIndex].magnet = magnet;
+        }
+        
+        if (magnet) {
+            processEncoderData(angle, true);
+            updateHistory(angle);
             
-            // Обновляем данные для дисплея (ТОЛЬКО ДОБАВЛЕНИЕ)
-            if (displayIndex >= 0 && displayIndex < 4) {
-                nodeDisplayData[displayIndex].wind_angle = angle;
-                nodeDisplayData[displayIndex].magnet = magnet;
-            }
-            
-            if (magnet) {
-                processEncoderData(angle, true);
-                updateHistory(angle);
+            if (nodeAlarmState[nodeIndex]) {
+                sendEncoderAlarmStatus(nodeIndex, false, "Magnet restored");
+                nodeAlarmState[nodeIndex] = false;
                 
-                if (nodeAlarmState[nodeIndex]) {
-                    sendEncoderAlarmStatus(nodeIndex, false, "Магнит энкодера восстановлен");
-                    nodeAlarmState[nodeIndex] = false;
-                    
-                    // Обновляем данные для дисплея (ТОЛЬКО ДОБАВЛЕНИЕ)
-                    if (displayIndex >= 0 && displayIndex < 4) {
-                        nodeDisplayData[displayIndex].alarm = false;
-                    }
+                if (displayIndex >= 0 && displayIndex < 4) {
+                    nodeDisplayData[displayIndex].alarm = false;
                 }
-                
-                Serial.printf("🌪️ Энкодер: угол=%.1f°, магнит=да\n", angle);
-            } else {
-                if (!nodeAlarmState[nodeIndex]) {
-                    sendEncoderAlarmStatus(nodeIndex, true, "Потеря магнита энкодера");
-                    nodeAlarmState[nodeIndex] = true;
-                    
-                    // Обновляем данные для дисплея (ТОЛЬКО ДОБАВЛЕНИЕ)
-                    if (displayIndex >= 0 && displayIndex < 4) {
-                        nodeDisplayData[displayIndex].alarm = true;
-                    }
-                }
-                Serial.printf("🌪️ Энкодер: магнит=НЕТ! (угол=%.1f° игнорируется)\n", angle);
             }
             
-            // Обновляем сектор ветра (ТОЛЬКО ДОБАВЛЕНИЕ)
-            if (displayIndex >= 0 && displayIndex < 4) {
-                nodeDisplayData[displayIndex].wind_sector = windCurrentSector;
+            Serial.printf("Encoder: %.1f° magnet=yes\n", angle);
+        } else {
+            if (!nodeAlarmState[nodeIndex]) {
+                sendEncoderAlarmStatus(nodeIndex, true, "Magnet lost");
+                nodeAlarmState[nodeIndex] = true;
+                
+                if (displayIndex >= 0 && displayIndex < 4) {
+                    nodeDisplayData[displayIndex].alarm = true;
+                }
             }
+            Serial.printf("Encoder: magnet=NO (%.1f°)\n", angle);
+        }
+        
+        if (displayIndex >= 0 && displayIndex < 4) {
+            nodeDisplayData[displayIndex].wind_sector = windCurrentSector;
+        }
+        
+        // Обновляем компас на странице метеостанции при новых данных энкодера
+        if (currentPage == PAGE_WEATHER) {
+            displayWeatherPage();
         }
     }
 }
@@ -791,6 +676,9 @@ void processGreenhouseData(const uint8_t *data) {
     strncpy(temp_in, pkt.temp_in, 4);
     strncpy(temp_out, pkt.temp_out, 4);
 
+    currentTemp = atof(temp_out);
+    currentHumidity = pkt.hum_in;
+
     StaticJsonDocument<300> resp;
     resp["type"] = "greenhouse_data";
     resp["temp_in"] = temp_in;
@@ -803,27 +691,70 @@ void processGreenhouseData(const uint8_t *data) {
     serializeJson(resp, json);
     ws.textAll(json);
     
-    Serial.println("🌿 Данные теплицы обновлены");
+    Serial.println("Greenhouse data updated");
+    
+    // Обновляем страницу метеостанции при новых данных
+    if (currentPage == PAGE_WEATHER) {
+        displayWeatherPage();
+    }
+}
+
+void checkNodeConnection() {
+    unsigned long now = millis();
+    for (int i = 0; i < NODE_COUNT; i++) {
+        if (lastNodeDataTime[i] > 0) {
+            if (now - lastNodeDataTime[i] > NODE_TIMEOUT_MS) {
+                if (!nodeConnectionLost[i]) {
+                    nodeConnectionLost[i] = true;
+                    connectionLostTime[i] = now;
+                    Serial.printf("Node #%d LOST!\n", nodeNumbers[i]);
+                    sendConnectionStatusToWeb(i, false);
+                    
+                    if (i < 4) {
+                        nodeDisplayData[i].connected = false;
+                    }
+                }
+            } else {
+                if (nodeConnectionLost[i]) {
+                    nodeConnectionLost[i] = false;
+                    Serial.printf("Node #%d RESTORED!\n", nodeNumbers[i]);
+                    sendConnectionStatusToWeb(i, true);
+                    
+                    if (i < 4) {
+                        nodeDisplayData[i].connected = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+void sendConnectionStatusToWeb(int nodeIndex, bool connected) {
+    StaticJsonDocument<100> doc;
+    doc["type"] = connected ? "connection_restored" : "connection_lost";
+    doc["node"] = nodeNumbers[nodeIndex];
+    String json;
+    serializeJson(doc, json);
+    ws.textAll(json);
+}
+
+void updateAlarmState() {
+    if (securityAlarmActive && (millis() - alarmStartTime) > ALARM_DURATION_MS) {
+        securityAlarmActive = false;
+    }
 }
 
 void sendEncoderAlarmStatus(int nodeIndex, bool alarm, const char* message) {
     nodeAlarmState[nodeIndex] = alarm;
-    
     StaticJsonDocument<200> doc;
     doc["type"] = "encoder_alarm";
     doc["node"] = nodeNumbers[nodeIndex];
     doc["alarm"] = alarm;
     doc["message"] = message;
-    
     String json;
     serializeJson(doc, json);
     ws.textAll(json);
-    
-    if (alarm) {
-        Serial.printf("🚨 Тревога энкодера на узле #%d: %s\n", nodeNumbers[nodeIndex], message);
-    } else {
-        Serial.printf("✅ Тревога энкодера снята на узле #%d: %s\n", nodeNumbers[nodeIndex], message);
-    }
+    Serial.printf("Encoder alarm #%d: %s\n", nodeNumbers[nodeIndex], message);
 }
 
 // ========== ФУНКЦИИ МЕТЕОСТАНЦИИ ==========
@@ -839,9 +770,7 @@ void updateWeatherHistory(float pressure, float temp, float humidity) {
     
     calculatePressureTrends();
     
-    // Обновляем прогноз раз в 30 минут
-    unsigned long now = millis();
-    if (now - lastForecastUpdate > FORECAST_UPDATE_INTERVAL) {
+    if (millis() - lastForecastUpdate > FORECAST_UPDATE_INTERVAL) {
         time_t nowTime = time(nullptr);
         struct tm *timeinfo = localtime(&nowTime);
         int month = timeinfo->tm_mon + 1;
@@ -850,119 +779,87 @@ void updateWeatherHistory(float pressure, float temp, float humidity) {
         shortForecast = generateForecast(pressure, pressureTrend3h, humidity, month);
         weatherIcon = getWeatherIcon(shortForecast);
         frostRisk = checkFrostRisk(temp, hour, month);
-        lastForecastUpdate = now;
+        lastForecastUpdate = millis();
         
         broadcastWeatherData();
     }
 }
 
 void calculatePressureTrends() {
-    if (weatherCount < 6) return; // Нужно минимум 3 часа данных
-    
+    if (weatherCount < 6) return;
     unsigned long now = millis();
-    float pressureNow = 0;
-    float pressure3hAgo = 0;
-    float pressure6hAgo = 0;
-    float pressure12hAgo = 0;
+    float pressureNow = 0, pressure3hAgo = 0, pressure6hAgo = 0, pressure12hAgo = 0;
     int countNow = 0, count3h = 0, count6h = 0, count12h = 0;
     
     for (int i = 0; i < weatherCount; i++) {
         unsigned long age = now - weatherHistory[i].timestamp;
-        
-        if (age < 300000) { // Последние 5 минут
-            pressureNow += weatherHistory[i].pressure;
-            countNow++;
-        }
-        if (age > 900000 && age < 1170000) { // 3 часа назад +- 15 мин
-            pressure3hAgo += weatherHistory[i].pressure;
-            count3h++;
-        }
-        if (age > 1980000 && age < 2220000) { // 6 часов назад +- 15 мин
-            pressure6hAgo += weatherHistory[i].pressure;
-            count6h++;
-        }
-        if (age > 4140000 && age < 4380000) { // 12 часов назад +- 15 мин
-            pressure12hAgo += weatherHistory[i].pressure;
-            count12h++;
-        }
+        if (age < 300000) { pressureNow += weatherHistory[i].pressure; countNow++; }
+        if (age > 900000 && age < 1170000) { pressure3hAgo += weatherHistory[i].pressure; count3h++; }
+        if (age > 1980000 && age < 2220000) { pressure6hAgo += weatherHistory[i].pressure; count6h++; }
+        if (age > 4140000 && age < 4380000) { pressure12hAgo += weatherHistory[i].pressure; count12h++; }
     }
     
-    if (countNow > 0 && count3h > 0) {
-        pressureTrend3h = (pressureNow/countNow) - (pressure3hAgo/count3h);
-    }
-    if (countNow > 0 && count6h > 0) {
-        pressureTrend6h = (pressureNow/countNow) - (pressure6hAgo/count6h);
-    }
-    if (countNow > 0 && count12h > 0) {
-        pressureTrend12h = (pressureNow/countNow) - (pressure12hAgo/count12h);
-    }
+    if (countNow > 0 && count3h > 0) pressureTrend3h = (pressureNow/countNow) - (pressure3hAgo/count3h);
+    if (countNow > 0 && count6h > 0) pressureTrend6h = (pressureNow/countNow) - (pressure6hAgo/count6h);
+    if (countNow > 0 && count12h > 0) pressureTrend12h = (pressureNow/countNow) - (pressure12hAgo/count12h);
 }
 
 String generateForecast(float pressure, float trend, float humidity, int month) {
-    // Метод Zambretti для домашней метеостанции
     bool isWinter = (month <= 3 || month >= 10);
     
-    if (trend > 1.5) { // Быстрый рост
-        if (pressure > 1020) return "Ясно, улучшение";
-        if (pressure > 1005) return "Переменная облачность";
-        return "Облачно, но без осадков";
-    }
-    else if (trend > 0.3) { // Медленный рост
-        if (pressure > 1015) return "Малооблачно";
-        return "Облачно с прояснениями";
-    }
-    else if (trend > -0.3) { // Стабильно
-        if (pressure > 1020) return "Ясно";
-        if (pressure > 1010) return "Переменная облачность";
-        return "Облачно";
-    }
-    else if (trend > -1.5) { // Медленное падение
-        if (humidity > 80) return "Возможен дождь";
-        return "Пасмурно";
-    }
-    else { // Быстрое падение
+    if (trend > 1.5) {
+        if (pressure > 1020) return "Clear, improving";
+        if (pressure > 1005) return "Partly cloudy";
+        return "Cloudy, no rain";
+    } else if (trend > 0.3) {
+        if (pressure > 1015) return "Mostly clear";
+        return "Cloudy breaks";
+    } else if (trend > -0.3) {
+        if (pressure > 1020) return "Clear";
+        if (pressure > 1010) return "Partly cloudy";
+        return "Cloudy";
+    } else if (trend > -1.5) {
+        if (humidity > 80) return "Possible rain";
+        return "Overcast";
+    } else {
         if (isWinter) {
-            if (pressure < 1000) return "Снегопад, ветер";
-            return "Облачно, снег";
+            if (pressure < 1000) return "Snow, windy";
+            return "Cloudy, snow";
         } else {
-            if (humidity > 85) return "Дождь, гроза";
-            return "Дождь";
+            if (humidity > 85) return "Rain, thunder";
+            return "Rain";
         }
     }
 }
 
 String getWeatherIcon(String forecast) {
-    if (forecast.indexOf("Ясно") >= 0) return "☀️";
-    if (forecast.indexOf("Малооблачно") >= 0) return "🌤️";
-    if (forecast.indexOf("Переменная облачность") >= 0) return "⛅";
-    if (forecast.indexOf("Облачно с прояснениями") >= 0) return "🌥️";
-    if (forecast.indexOf("Облачно") >= 0) return "☁️";
-    if (forecast.indexOf("Пасмурно") >= 0) return "☁️☁️";
-    if (forecast.indexOf("дождь") >= 0) return "🌧️";
-    if (forecast.indexOf("гроза") >= 0) return "⛈️";
-    if (forecast.indexOf("снег") >= 0) return "❄️";
-    if (forecast.indexOf("Снегопад") >= 0) return "🌨️";
+    if (forecast.indexOf("Clear") >= 0) return "☀️";
+    if (forecast.indexOf("Mostly clear") >= 0) return "🌤️";
+    if (forecast.indexOf("Partly cloudy") >= 0) return "⛅";
+    if (forecast.indexOf("Cloudy breaks") >= 0) return "🌥️";
+    if (forecast.indexOf("Cloudy") >= 0) return "☁️";
+    if (forecast.indexOf("Overcast") >= 0) return "☁️☁️";
+    if (forecast.indexOf("rain") >= 0) return "🌧️";
+    if (forecast.indexOf("thunder") >= 0) return "⛈️";
+    if (forecast.indexOf("snow") >= 0) return "❄️";
     return "☀️";
 }
 
 String checkFrostRisk(float temp, int hour, int month) {
-    // Метод Броунова для заморозков (апрель-сентябрь)
-    if (month < 4 || month > 9) return "❄️ Сезонный";
+    if (month < 4 || month > 9) return "❄️ Seasonal";
     
-    // Проверяем в вечернее время (20-22 часа)
     if (hour >= 20 && hour <= 22) {
-        if (temp < 3.0) return "⚠️ Высокий риск заморозков";
-        if (temp < 6.0) return "⚠️ Средний риск заморозков";
-        if (temp < 10.0) return "⚠️ Низкий риск заморозков";
+        if (temp < 3.0) return "High risk";
+        if (temp < 6.0) return "Medium risk";
+        if (temp < 10.0) return "Low risk";
     }
     
-    // Ночью или утром проверяем текущую температуру
     if (hour >= 0 && hour <= 6) {
-        if (temp < 2.0) return "❄️ Заморозок!";
-        if (temp < 5.0) return "⚠️ Близко к нулю";
+        if (temp < 2.0) return "❄️ Frost!";
+        if (temp < 5.0) return "Near zero";
     }
     
-    return "✅ Без риска";
+    return "No risk";
 }
 
 void broadcastWeatherData() {
@@ -992,10 +889,13 @@ void processEncoderData(float angle, bool magnet) {
         currentEncoderAngle = angle;
         windDirection = angle;
         windCurrentSector = 0.0;
-        Serial.printf("🌪️ Первое значение %.1f°\n", angle);
+        Serial.printf("First value %.1f°\n", angle);
     } else {
         prevEncoderAngle = currentEncoderAngle;
         currentEncoderAngle = angle;
+        
+        float diff = fmod(currentEncoderAngle - prevEncoderAngle + 540.0, 360.0) - 180.0;
+        windCurrentSector = fabs(diff);
         
         float rad1 = radians(prevEncoderAngle);
         float rad2 = radians(currentEncoderAngle);
@@ -1005,12 +905,8 @@ void processEncoderData(float angle, bool magnet) {
         windDirection = degrees(meanRad);
         if (windDirection < 0) windDirection += 360.0;
         
-        float diff = fmod(currentEncoderAngle - prevEncoderAngle + 540.0, 360.0) - 180.0;
-        windCurrentSector = fabs(diff);
-        
-        Serial.printf("🌪️ Напр=%.1f°, сектор=%.1f°\n", windDirection, windCurrentSector);
+        Serial.printf("Dir=%.1f°, sector=%.1f°\n", windDirection, windCurrentSector);
     }
-    
     windMagnet = magnet;
 }
 
@@ -1018,45 +914,14 @@ void updateHistory(float angle) {
     encoderHistory[historyIndex] = angle;
     historyTimestamps[historyIndex] = millis();
     historyIndex = (historyIndex + 1) % ENCODER_HISTORY_SIZE;
-    if (historyCount < ENCODER_HISTORY_SIZE) {
-        historyCount++;
-    }
+    if (historyCount < ENCODER_HISTORY_SIZE) historyCount++;
 }
 
 void updateMaxMin() {
-    if (historyCount < 2) return;
-    if (!windMagnet) return;
-    
+    if (historyCount < 2 || !windMagnet) return;
     unsigned long now = millis();
     
-    // 1. Красный сектор (текущий размах - последние 30 сек)
-    float currentMin = 361.0;
-    float currentMax = -1.0;
-    int currentCount = 0;
-    
-    int startIdx = (historyIndex - 6 + ENCODER_HISTORY_SIZE) % ENCODER_HISTORY_SIZE;
-    for (int i = 0; i < 6; i++) {
-        int idx = (startIdx + i) % ENCODER_HISTORY_SIZE;
-        if (idx < historyCount) {
-            float a = encoderHistory[idx];
-            if (a < currentMin) currentMin = a;
-            if (a > currentMax) currentMax = a;
-            currentCount++;
-        }
-    }
-    
-    if (currentCount >= 2 && currentMax >= 0 && currentMin <= 360) {
-        float redStart = windDirection - windCurrentSector / 2;
-        float redEnd = windDirection + windCurrentSector / 2;
-        redStart = fmod(fmod(redStart, 360) + 360, 360);
-        redEnd = fmod(fmod(redEnd, 360) + 360, 360);
-        currentSectorStart = redStart;
-        currentSectorEnd = redEnd;
-    }
-    
-    // 2. Желтый сектор (максимальный размах за HISTORY_PERIOD_MS)
-    float periodMin = 361.0;
-    float periodMax = -1.0;
+    float periodMin = 361.0, periodMax = -1.0;
     int periodCount = 0;
     
     for (int i = 0; i < historyCount; i++) {
@@ -1068,28 +933,23 @@ void updateMaxMin() {
         }
     }
     
-    if (periodCount >= 2 && periodMax >= 0 && periodMin <= 360) {
+    if (periodCount >= 2) {
         float periodWidth = periodMax - periodMin;
         if (periodWidth < 0) periodWidth += 360;
         if (periodWidth > 180) periodWidth = 360 - periodWidth;
         
         if (periodWidth > maxSectorWidth) {
             maxSectorWidth = periodWidth;
-            
             float centerAngle = (periodMin + periodMax) / 2.0;
-            if (periodMax - periodMin > 180) {
-                centerAngle += 180;
-                if (centerAngle >= 360) centerAngle -= 360;
-            }
-            
+            if (periodMax - periodMin > 180) centerAngle += 180;
+            if (centerAngle >= 360) centerAngle -= 360;
             maxSectorStart = centerAngle - maxSectorWidth / 2;
             maxSectorEnd = centerAngle + maxSectorWidth / 2;
             maxSectorStart = fmod(fmod(maxSectorStart, 360) + 360, 360);
             maxSectorEnd = fmod(fmod(maxSectorEnd, 360) + 360, 360);
-            
             maxSectorTimestamp = now;
             
-            Serial.printf("📊 НОВЫЙ МАКС: %.1f°\n", maxSectorWidth);
+            Serial.printf("NEW MAX: %.1f°\n", maxSectorWidth);
         }
         
         if (now - maxSectorTimestamp > HISTORY_PERIOD_MS) {
@@ -1097,8 +957,6 @@ void updateMaxMin() {
             maxSectorStart = currentSectorStart;
             maxSectorEnd = currentSectorEnd;
             maxSectorTimestamp = now;
-            
-            Serial.println("📊 Сброс желтого сектора");
         }
     }
 }
@@ -1109,27 +967,16 @@ void broadcastEncoderData() {
     if (!windMagnet) {
         StaticJsonDocument<128> doc;
         doc["type"] = "wind";
-        doc["angle_avg"] = "0";
-        doc["sector_width"] = "0";
-        doc["sector_start"] = "0";
-        doc["sector_end"] = "0";
-        doc["history_min"] = "0";
-        doc["history_max"] = "0";
-        doc["history_width"] = "0";
         doc["magnet"] = false;
         doc["stability"] = "no_magnet";
-        
         String json;
         serializeJson(doc, json);
         ws.textAll(json);
-        
         return;
     }
     
-    float redStart = windDirection - windCurrentSector / 2;
-    float redEnd = windDirection + windCurrentSector / 2;
-    redStart = fmod(fmod(redStart, 360) + 360, 360);
-    redEnd = fmod(fmod(redEnd, 360) + 360, 360);
+    float redStart = fmod(fmod(windDirection - windCurrentSector/2, 360) + 360, 360);
+    float redEnd = fmod(fmod(windDirection + windCurrentSector/2, 360) + 360, 360);
     
     String stability;
     if (windCurrentSector < 10) stability = "calm";
@@ -1148,10 +995,6 @@ void broadcastEncoderData() {
         doc["history_min"] = serialized(String(maxSectorStart, 0));
         doc["history_max"] = serialized(String(maxSectorEnd, 0));
         doc["history_width"] = serialized(String(maxSectorWidth, 1));
-    } else {
-        doc["history_min"] = "0";
-        doc["history_max"] = "0";
-        doc["history_width"] = "0";
     }
     
     doc["magnet"] = windMagnet;
@@ -1161,14 +1004,14 @@ void broadcastEncoderData() {
     serializeJson(doc, json);
     ws.textAll(json);
     
-    Serial.printf("🌪️ Ветер: напр=%.1f°, красный=%.1f°, желтый=%.1f°\n",
+    Serial.printf("Wind: dir=%.1f°, red=%.1f°, yellow=%.1f°\n",
                   windDirection, windCurrentSector, maxSectorWidth);
 }
 
-// ========== НОВЫЕ ФУНКЦИИ ДЛЯ ПЕРИФЕРИИ ==========
+// ========== ФУНКЦИИ ДИСПЛЕЯ ==========
 
 void initDisplay() {
-    Serial.print("Инициализация дисплея... ");
+    Serial.print("Init display... ");
     pinMode(TFT_LED, OUTPUT);
     digitalWrite(TFT_LED, HIGH);
     
@@ -1181,14 +1024,14 @@ void initDisplay() {
     tft.setCursor(20, 50);
     tft.print("SmartHome Hub");
     tft.setCursor(20, 70);
-    tft.print("Version 6.0 + Disp");
+    tft.print("Version 6.6");
     delay(2000);
     tft.fillScreen(ST77XX_BLACK);
     Serial.println("OK");
 }
 
 void initRTC() {
-    Serial.print("Инициализация RTC... ");
+    Serial.print("Init RTC... ");
     Wire.begin(RTC_SDA, RTC_SCL);
     Wire.setClock(100000);
     
@@ -1208,13 +1051,10 @@ void initRTC() {
     }
     
     lastRTCRead = rtc.now();
-    Serial.printf("Время: %02d:%02d:%02d %02d.%02d\n",
-                  lastRTCRead.hour(), lastRTCRead.minute(), lastRTCRead.second(),
-                  lastRTCRead.day(), lastRTCRead.month());
 }
 
 void initSD() {
-    Serial.print("Инициализация SD карты... ");
+    Serial.print("Init SD card... ");
     strcpy(sdErrorMsg, "OK");
     
     pinMode(SD_CS, OUTPUT);
@@ -1242,6 +1082,22 @@ void initSD() {
     Serial.println("OK");
     
     updateSDInfo();
+}
+
+void checkHTMLFile() {
+    if (!sdInitialized) {
+        Serial.println("❌ SD card not initialized");
+        return;
+    }
+    
+    if (SD.exists("/index.html")) {
+        File file = SD.open("/index.html");
+        size_t size = file.size();
+        file.close();
+        Serial.printf("✅ HTML file found, size: %d bytes\n", size);
+    } else {
+        Serial.println("❌ HTML file not found! Create index.html on SD card");
+    }
 }
 
 void updateSDInfo() {
@@ -1283,11 +1139,13 @@ String formatTime(int value) {
 }
 
 void drawTimeBar() {
+    uint16_t barColor = securityAlarmActive ? ST77XX_RED : ST77XX_GREEN;
+    
     if (!rtcOK) {
-        tft.fillRect(0, 0, 160, 15, ST77XX_BLUE);
+        tft.fillRect(0, 0, 160, 15, barColor);
         tft.setCursor(5, 3);
-        tft.setTextColor(ST77XX_WHITE);
-        tft.print("RTC ERROR");
+        tft.setTextColor(ST77XX_BLUE);
+        tft.print(rusToEng("RTC OSHIBKA"));
         return;
     }
     
@@ -1296,25 +1154,19 @@ void drawTimeBar() {
         lastRTCReadTime = millis();
     }
     
-    sprintf(timeStr, "%02d:%02d:%02d", lastRTCRead.hour(), lastRTCRead.minute(), lastRTCRead.second());
-    sprintf(dateStr, "%02d.%02d", lastRTCRead.day(), lastRTCRead.month());
+    sprintf(timeStr, "%02d:%02d", lastRTCRead.hour(), lastRTCRead.minute());
+    sprintf(dateStr, "%02d.%02d.%04d", lastRTCRead.day(), lastRTCRead.month(), lastRTCRead.year());
     
-    tft.fillRect(0, 0, 160, 15, ST77XX_BLUE);
+    tft.fillRect(0, 0, 160, 15, barColor);
     tft.setCursor(5, 3);
-    tft.setTextColor(ST77XX_WHITE);
+    tft.setTextColor(ST77XX_BLUE);
     tft.print(timeStr);
     
-    tft.setCursor(70, 3);
+    tft.setCursor(60, 3);
     tft.print(dateStr);
     
-    tft.setCursor(110, 3);
-    tft.setTextColor(ST77XX_YELLOW);
-    if (currentPage == PAGE_WEATHER) tft.print("WTHR");
-    else if (currentPage == PAGE_NODE_INFO) tft.print("NODE");
-    else tft.print("SD");
-    
     tft.setCursor(140, 3);
-    tft.setTextColor(sdInitialized ? ST77XX_GREEN : ST77XX_RED);
+    tft.setTextColor(sdInitialized ? ST77XX_BLUE : ST77XX_RED);
     tft.print(sdInitialized ? "SD" : "NO");
 }
 
@@ -1323,30 +1175,30 @@ void displayWeatherPage() {
     
     tft.setCursor(5, 20);
     tft.setTextColor(ST77XX_WHITE);
-    tft.print("Weather Station");
+    tft.print(rusToEng("Meteostanciya"));
     
     tft.setCursor(5, 35);
-    tft.print("Temp: ");
+    tft.print(rusToEng("Temp: "));
     tft.setTextColor(ST77XX_YELLOW);
     tft.print(currentTemp, 1);
     tft.print("C");
     
     tft.setTextColor(ST77XX_WHITE);
     tft.setCursor(5, 50);
-    tft.print("Press: ");
+    tft.print(rusToEng("Davlenie: "));
     tft.setTextColor(ST77XX_CYAN);
     tft.print(currentPressure, 1);
     tft.print("mm");
     
     tft.setTextColor(ST77XX_WHITE);
     tft.setCursor(5, 65);
-    tft.print("Hum: ");
+    tft.print(rusToEng("Vlazhnost: "));
     tft.setTextColor(ST77XX_GREEN);
     tft.print(currentHumidity, 0);
     tft.print("%");
     
     tft.setCursor(5, 85);
-    tft.print("Forecast:");
+    tft.print(rusToEng("Prognoz:"));
     tft.setCursor(5, 97);
     tft.setTextColor(ST77XX_YELLOW);
     tft.print(shortForecast);
@@ -1359,13 +1211,13 @@ void displayWeatherPage() {
     
     tft.setCursor(5, 115);
     tft.setTextColor(ST77XX_WHITE);
-    tft.print("Frost: ");
-    if (frostRisk.indexOf("Высокий") >= 0) tft.setTextColor(ST77XX_RED);
-    else if (frostRisk.indexOf("Средний") >= 0) tft.setTextColor(ST77XX_ORANGE);
+    tft.print(rusToEng("Zamorozki: "));
+    if (frostRisk.indexOf("High") >= 0) tft.setTextColor(ST77XX_RED);
+    else if (frostRisk.indexOf("Medium") >= 0) tft.setTextColor(ST77XX_ORANGE);
     else tft.setTextColor(ST77XX_GREEN);
     tft.print(frostRisk);
     
-    draw_compass(120, 130, 20, windDirection, windCurrentSector, windMagnet);
+    draw_compass(120, 115, 18, windDirection, windCurrentSector, windMagnet);
 }
 
 void displayNodePage() {
@@ -1377,37 +1229,37 @@ void displayNodePage() {
         tft.fillRect(0, 18, 160, 12, ST77XX_RED);
         tft.setCursor(5, 20);
         tft.setTextColor(ST77XX_WHITE);
-        tft.print("CONNECTION LOST!");
+        tft.print(rusToEng("NET SVYAZI!"));
     } else if (node.alarm) {
         tft.fillRect(0, 18, 160, 12, alarmBlinkState ? ST77XX_RED : ST77XX_BLUE);
         tft.setCursor(5, 20);
         tft.setTextColor(ST77XX_WHITE);
-        tft.print("ALARM!");
+        tft.print(rusToEng("TREVOGA!"));
     }
     
     int yOffset = (node.connected && !node.alarm) ? 25 : 35;
     
     tft.setCursor(5, yOffset);
     tft.setTextColor(ST77XX_WHITE);
-    tft.print("Node #");
+    tft.print(rusToEng("Uzel #"));
     tft.print(node.id);
     
     tft.setCursor(5, yOffset + 12);
-    tft.print("Temp: ");
+    tft.print(rusToEng("Temp: "));
     tft.setTextColor(ST77XX_YELLOW);
     tft.print(node.temp, 1);
     tft.print("C");
     
     tft.setCursor(5, yOffset + 24);
     tft.setTextColor(ST77XX_WHITE);
-    tft.print("Hum: ");
+    tft.print(rusToEng("Vlazhn: "));
     tft.setTextColor(ST77XX_GREEN);
     tft.print(node.hum, 0);
     tft.print("%");
     
     tft.setCursor(5, yOffset + 36);
     tft.setTextColor(ST77XX_WHITE);
-    tft.print("Press: ");
+    tft.print(rusToEng("Davlenie: "));
     tft.setTextColor(ST77XX_CYAN);
     tft.print(node.press, 1);
     tft.print("mm");
@@ -1415,30 +1267,18 @@ void displayNodePage() {
     tft.setCursor(5, yOffset + 48);
     tft.setTextColor(ST77XX_WHITE);
     tft.print("LED: ");
-    tft.setTextColor(node.led_state ? ST77XX_GREEN : ST77XX_RED);
-    tft.print(node.led_state ? "ON" : "OFF");
-    
-    if (node.id == 102 && node.connected) {
-        draw_compass(110, 110, 20, node.wind_angle, node.wind_sector, node.magnet);
-        
-        tft.setCursor(5, yOffset + 60);
-        tft.setTextColor(ST77XX_WHITE);
-        tft.print("Wind: ");
-        tft.print(node.wind_angle, 0);
-        tft.print("° ±");
-        tft.print(node.wind_sector, 0);
-        tft.print("°");
-        
-        tft.setCursor(5, yOffset + 72);
-        tft.print("Magnet: ");
-        tft.setTextColor(node.magnet ? ST77XX_GREEN : ST77XX_RED);
-        tft.print(node.magnet ? "OK" : "LOST");
+    if (node.led_state) {
+        tft.setTextColor(ST77XX_RED);
+        tft.print("ON");
+    } else {
+        tft.setTextColor(ST77XX_GREEN);
+        tft.print("OFF");
     }
     
     tft.fillRect(0, 150, 160, 10, ST77XX_BLUE);
     tft.setCursor(50, 152);
     tft.setTextColor(ST77XX_WHITE);
-    tft.print("Node ");
+    tft.print(rusToEng("Uzel "));
     tft.print(displayNodeIndex + 1);
     tft.print("/4");
 }
@@ -1448,12 +1288,12 @@ void displaySDPage() {
     
     tft.setCursor(5, 20);
     tft.setTextColor(ST77XX_WHITE);
-    tft.print("SD CARD MONITOR");
+    tft.print(rusToEng("SD KARTA"));
     
     if (!sdInitialized) {
         tft.setCursor(5, 40);
         tft.setTextColor(ST77XX_RED);
-        tft.print("ERROR: ");
+        tft.print(rusToEng("OSHI BKA: "));
         tft.print(sdErrorMsg);
         return;
     }
@@ -1462,7 +1302,7 @@ void displaySDPage() {
     
     tft.setCursor(5, 35);
     tft.setTextColor(ST77XX_CYAN);
-    tft.print("Type: ");
+    tft.print(rusToEng("Tip: "));
     tft.setTextColor(ST77XX_WHITE);
     if (sdCardType == CARD_MMC) tft.print("MMC");
     else if (sdCardType == CARD_SD) tft.print("SDSC");
@@ -1471,21 +1311,21 @@ void displaySDPage() {
     
     tft.setCursor(5, 47);
     tft.setTextColor(ST77XX_CYAN);
-    tft.print("Size: ");
+    tft.print(rusToEng("Razmer: "));
     tft.setTextColor(ST77XX_WHITE);
     tft.print(sdTotalBytes);
     tft.print(" MB");
     
     tft.setCursor(5, 59);
     tft.setTextColor(ST77XX_CYAN);
-    tft.print("Used: ");
+    tft.print(rusToEng("Zanyato: "));
     tft.setTextColor(ST77XX_YELLOW);
     tft.print(sdUsedBytes);
     tft.print(" MB");
     
     tft.setCursor(5, 71);
     tft.setTextColor(ST77XX_CYAN);
-    tft.print("Free: ");
+    tft.print(rusToEng("Svobodno: "));
     tft.setTextColor(ST77XX_GREEN);
     tft.print(sdTotalBytes - sdUsedBytes);
     tft.print(" MB");
@@ -1500,13 +1340,15 @@ void displaySDPage() {
     
     tft.setCursor(5, 105);
     tft.setTextColor(ST77XX_CYAN);
-    tft.print("Writes: ");
+    tft.print(rusToEng("Zapisey: "));
     tft.setTextColor(ST77XX_WHITE);
     tft.print(sdWriteCount);
     
     tft.setCursor(5, 120);
     tft.setTextColor(ST77XX_CYAN);
-    tft.print("File: weather.csv");
+    tft.print(rusToEng("Fayl: "));
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print("weather.csv");
 }
 
 void draw_compass(int cx, int cy, int r, float angle, float sector, bool magnet) {
@@ -1555,7 +1397,6 @@ void handleButtons() {
     bool btnCycle = digitalRead(BTN_CYCLE);
     bool btnEnter = digitalRead(BTN_ENTER);
     
-    // Cycle button
     if (btnCycle == LOW && lastBtnCycle == HIGH && (now - lastDebounceCycle) > DEBOUNCE_DELAY) {
         lastDebounceCycle = now;
         
@@ -1571,7 +1412,6 @@ void handleButtons() {
     }
     lastBtnCycle = btnCycle;
     
-    // Enter button
     if (btnEnter == LOW && lastBtnEnter == HIGH && (now - lastDebounceEnter) > DEBOUNCE_DELAY) {
         lastDebounceEnter = now;
         enterPressStart = now;
@@ -1580,7 +1420,6 @@ void handleButtons() {
     
     if (btnEnter == HIGH && lastBtnEnter == LOW) {
         if (!enterLongPressHandled && (now - enterPressStart) < LONG_PRESS_MS) {
-            // Short press
             currentPage = (DisplayPage)((currentPage + 1) % PAGE_COUNT);
             
             if (currentPage == PAGE_WEATHER) displayWeatherPage();
@@ -1629,20 +1468,5 @@ void updateAlarmSound() {
     } else {
         ledcWriteTone(BUZZER_CHANNEL, 0);
         buzzerState = false;
-    }
-}
-    void checkHTMLFile() {
-    if (!sdInitialized) {
-        Serial.println("❌ SD карта не инициализирована");
-        return;
-    }
-    
-    if (SD.exists("/index.html")) {
-        File file = SD.open("/index.html");
-        size_t size = file.size();
-        file.close();
-        Serial.printf("✅ HTML файл найден, размер: %d байт\n", size);
-    } else {
-        Serial.println("❌ HTML файл не найден! Создайте index.html на SD карте");
     }
 }
