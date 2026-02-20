@@ -185,7 +185,7 @@ float tempTrend3h = 0;
 
 String shortForecast = "---";
 String frostRisk = "---";
-String weatherIcon = "☀️";
+String weatherIcon = "---";
 unsigned long lastForecastUpdate = 0;
 const unsigned long FORECAST_UPDATE_INTERVAL = 1800000;
 
@@ -840,7 +840,7 @@ String getWeatherIcon(String forecast) {
     if (forecast.indexOf("rain") >= 0) return "🌧️";
     if (forecast.indexOf("thunder") >= 0) return "⛈️";
     if (forecast.indexOf("snow") >= 0) return "❄️";
-    return "☀️";
+    return "---";
 }
 
 String getWeatherText(String icon) {
@@ -858,21 +858,22 @@ String getWeatherText(String icon) {
 }
 
 String checkFrostRisk(float temp, int hour, int month) {
-    if (month < 4 || month > 9) return "❄️ Seasonal";
+    if (month < 4 || month > 9) return "0%";  // Не сезон
     
     if (hour >= 20 && hour <= 22) {
-        if (temp < 3.0) return "High risk";
-        if (temp < 6.0) return "Medium risk";
-        if (temp < 10.0) return "Low risk";
+        if (temp < 3.0) return "100%";
+        if (temp < 6.0) return "70%";
+        if (temp < 10.0) return "30%";
     }
     
     if (hour >= 0 && hour <= 6) {
-        if (temp < 2.0) return "❄️ Frost!";
-        if (temp < 5.0) return "Near zero";
+        if (temp < 2.0) return "100%";
+        if (temp < 5.0) return "80%";
     }
     
-    return "No risk";
+    return "0%";
 }
+
 
 void broadcastWeatherData() {
     if (currentPressure == 0) return;
@@ -1212,21 +1213,16 @@ void displayWeatherPage() {
     tft.setCursor(5, 80);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Prognoz:"));
-    tft.setCursor(5, 97);
-    tft.setTextColor(ST77XX_YELLOW);
+   
     
-    String forecast = shortForecast;
-    if (forecast.length() > 15) {
-        forecast = forecast.substring(0, 8) + "...";
-    }
-    tft.print(forecast);
+    
     
     // Текстовая иконка погоды вместо графической
-    tft.setCursor(100, 80);
+    tft.setCursor(60, 80);
     tft.setTextColor(ST77XX_CYAN);
     tft.print(getWeatherText(weatherIcon));
     
-    tft.setCursor(5, 115);
+    tft.setCursor(5, 100);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Zamorozki: "));
     
@@ -1244,7 +1240,7 @@ void displayWeatherPage() {
     }
     tft.print(frost);
     
-    draw_compass(120, 115, 18, windDirection, windCurrentSector, windMagnet);
+    draw_compass(130, 100, 18, windDirection, windCurrentSector, windMagnet);
 }
 
 void displayNodePage() {
@@ -1408,14 +1404,14 @@ void draw_compass(int cx, int cy, int r, float angle, float sector, bool magnet)
         return;
     }
     
-    tft.setTextColor(ST77XX_BLACK);
-    tft.setCursor(cx - 2, cy - r - 2);
+        tft.setTextColor(ST77XX_RED);
+    tft.setCursor(cx - 2, cy - r + 2);  // N — чуть ниже верхнего края
     tft.print("N");
-    tft.setCursor(cx + r + 2, cy - 3);
+    tft.setCursor(cx + r - 8, cy - 3);  // E — чуть левее правого края
     tft.print("E");
-    tft.setCursor(cx - 2, cy + r + 2);
+    tft.setCursor(cx - 2, cy + r - 8);  // S — чуть выше нижнего края
     tft.print("S");
-    tft.setCursor(cx - r - 8, cy - 3);
+    tft.setCursor(cx - r + 2, cy - 3);  // W — чуть правее левого края
     tft.print("W");
     
     if (sector > 0) {
