@@ -1,17 +1,18 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
- * ВЕРСИЯ 6.9: ПОЛНОЦЕННАЯ МЕТЕОСТАНЦИЯ С ПРОГНОЗОМ
+ * ВЕРСИЯ 7.0: ФИНАЛЬНАЯ СТАБИЛЬНАЯ
  * - Прогноз по давлению (метод Zambretti)
- * - Риск заморозков (метод Броунова)
+ * - Риск заморозков (метод Броунова) в процентах
  * - Тренды давления и температуры
  * - Визуальные индикаторы на веб-странице
  * - Дисплей с русскими надписями (транслит)
- * - SD карта для хранения HTML
+ * - SD карта для хранения HTML и логов
  * - RTC часы
  * - Кнопки управления
  * - Зуммер
- * - Компас
- * - Иконки погоды заменены на текст (без артефактов)
+ * - Компас на странице метеостанции (без артефактов)
+ * - Страница теплицы
+ * - Исправлены все артефакты при отсутствии SD
  */
 
 #include <WiFi.h>
@@ -66,7 +67,7 @@ SPIClass sdSPI = SPIClass(HSPI);
 // ========== КОНФИГУРАЦИЯ ХАБА ==========
 const char* AP_SSID = "SmartHome-Hub";
 const char* AP_PASSWORD = "12345678";
-const char* HUB_VERSION = "6.9";
+const char* HUB_VERSION = "7.0";
 const char* NODE_VERSION = "2.1";
 
 // MAC адреса узлов
@@ -105,6 +106,15 @@ struct NodeDisplayData {
     {104, 0, 0, 0, false, false, false, 0, 0, false},
     {105, 0, 0, 0, false, false, false, 0, 0, false}
 };
+
+// ========== ДАННЫЕ ТЕПЛИЦЫ ДЛЯ ДИСПЛЕЯ ==========
+struct GreenhouseDisplayData {
+    float temp_in;
+    float temp_out;
+    int hum_in;
+    bool relay1;
+    bool relay2;
+} greenhouseDisplay = {0, 0, 0, false, false};
 
 // ========== ESP-NOW СТРУКТУРЫ ==========
 typedef struct esp_now_message {
@@ -184,7 +194,7 @@ float pressureTrend12h = 0;
 float tempTrend3h = 0;
 
 String shortForecast = "---";
-String frostRisk = "---";
+String frostRisk = "0%";
 String weatherIcon = "---";
 unsigned long lastForecastUpdate = 0;
 const unsigned long FORECAST_UPDATE_INTERVAL = 1800000;
@@ -223,6 +233,7 @@ bool buzzerState = false;
 enum DisplayPage {
     PAGE_WEATHER,
     PAGE_NODE_INFO,
+    PAGE_GREENHOUSE,
     PAGE_SD_MONITOR,
     PAGE_COUNT
 };
@@ -266,6 +277,7 @@ void initSD();
 void updateSDInfo();
 void displayWeatherPage();
 void displayNodePage();
+void displayGreenhousePage();
 void displaySDPage();
 void drawTimeBar();
 void draw_compass(int cx, int cy, int r, float angle, float sector, bool magnet);
@@ -280,8 +292,8 @@ void checkHTMLFile();
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 6.9) ===");
-    Serial.println("=== С ТЕКСТОВЫМИ ИКОНКАМИ ПОГОДЫ ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 7.0) ===");
+    Serial.println("=== ФИНАЛЬНАЯ СТАБИЛЬНАЯ ВЕРСИЯ ===");
 
     // Инициализация пинов и периферии
     pinMode(TFT_LED, OUTPUT);
@@ -391,7 +403,9 @@ void loop() {
         static uint32_t lastSDInfoUpdate = 0;
         if (now - lastSDInfoUpdate >= 1000) {
             lastSDInfoUpdate = now;
-            updateSDInfo();
+            if (sdInitialized) {
+                updateSDInfo();
+            }
             displaySDPage();
         }
     }
@@ -676,6 +690,12 @@ void processGreenhouseData(const uint8_t *data) {
 
     currentTemp = atof(temp_out);
     currentHumidity = pkt.hum_in;
+    
+    greenhouseDisplay.temp_in = atof(temp_in);
+    greenhouseDisplay.temp_out = atof(temp_out);
+    greenhouseDisplay.hum_in = pkt.hum_in;
+    greenhouseDisplay.relay1 = pkt.relay1_state;
+    greenhouseDisplay.relay2 = pkt.relay2_state;
 
     StaticJsonDocument<300> resp;
     resp["type"] = "greenhouse_data";
@@ -691,9 +711,11 @@ void processGreenhouseData(const uint8_t *data) {
     
     Serial.println("Greenhouse data updated");
     
-    // Обновляем страницу метеостанции при новых данных
+    // Обновляем страницу метеостанции и теплицы при новых данных
     if (currentPage == PAGE_WEATHER) {
         displayWeatherPage();
+    } else if (currentPage == PAGE_GREENHOUSE) {
+        displayGreenhousePage();
     }
 }
 
@@ -806,44 +828,45 @@ String generateForecast(float pressure, float trend, float humidity, int month) 
     bool isWinter = (month <= 3 || month >= 10);
     
     if (trend > 1.5) {
-        if (pressure > 1020) return "Clear, improving";
-        if (pressure > 1005) return "Partly cloudy";
-        return "Cloudy, no rain";
+        if (pressure > 1020) return "YASNO UL";
+        if (pressure > 1005) return "PER OBL";
+        return "OBL BEZ OS";
     } else if (trend > 0.3) {
-        if (pressure > 1015) return "Mostly clear";
-        return "Cloudy breaks";
+        if (pressure > 1015) return "MALO OBL";
+        return "OBL PROYAS";
     } else if (trend > -0.3) {
-        if (pressure > 1020) return "Clear";
-        if (pressure > 1010) return "Partly cloudy";
-        return "Cloudy";
+        if (pressure > 1020) return "YASNO";
+        if (pressure > 1010) return "PER OBL";
+        return "OBLACHNO";
     } else if (trend > -1.5) {
-        if (humidity > 80) return "Possible rain";
-        return "Overcast";
+        if (humidity > 80) return "DOZHD?";
+        return "PASMURNO";
     } else {
         if (isWinter) {
-            if (pressure < 1000) return "Snow, windy";
-            return "Cloudy, snow";
+            if (pressure < 1000) return "SNEG VETER";
+            return "OBL SNEG";
         } else {
-            if (humidity > 85) return "Rain, thunder";
-            return "Rain";
+            if (humidity > 85) return "DOZHD GROZA";
+            return "DOZHD";
         }
     }
 }
 
 String getWeatherIcon(String forecast) {
-    if (forecast.indexOf("Clear") >= 0) return "☀️";
-    if (forecast.indexOf("Mostly clear") >= 0) return "🌤️";
-    if (forecast.indexOf("Partly cloudy") >= 0) return "⛅";
-    if (forecast.indexOf("Cloudy breaks") >= 0) return "🌥️";
-    if (forecast.indexOf("Cloudy") >= 0) return "☁️";
-    if (forecast.indexOf("Overcast") >= 0) return "☁️☁️";
-    if (forecast.indexOf("rain") >= 0) return "🌧️";
-    if (forecast.indexOf("thunder") >= 0) return "⛈️";
-    if (forecast.indexOf("snow") >= 0) return "❄️";
+    if (forecast.indexOf("YASNO") >= 0) return "☀️";
+    if (forecast.indexOf("MALO OBL") >= 0) return "🌤️";
+    if (forecast.indexOf("PER OBL") >= 0) return "⛅";
+    if (forecast.indexOf("OBL PROYAS") >= 0) return "🌥️";
+    if (forecast.indexOf("OBLACHNO") >= 0) return "☁️";
+    if (forecast.indexOf("PASMURNO") >= 0) return "☁️☁️";
+    if (forecast.indexOf("DOZHD") >= 0) return "🌧️";
+    if (forecast.indexOf("GROZA") >= 0) return "⛈️";
+    if (forecast.indexOf("SNEG") >= 0) return "❄️";
     return "---";
 }
 
 String getWeatherText(String icon) {
+    if (icon == "---") return "---";
     if (icon == "☀️") return "SOLNCE";
     if (icon == "🌤️") return "MALO SOLN";
     if (icon == "⛅") return "OBL SOLN";
@@ -853,12 +876,11 @@ String getWeatherText(String icon) {
     if (icon == "🌧️") return "DOZHD";
     if (icon == "⛈️") return "GROZA";
     if (icon == "❄️") return "SNEG";
-    if (icon == "🌨️") return "SNEGOPAD";
     return "---";
 }
 
 String checkFrostRisk(float temp, int hour, int month) {
-    if (month < 4 || month > 9) return "0%";  // Не сезон
+    if (month < 4 || month > 9) return "0%";
     
     if (hour >= 20 && hour <= 22) {
         if (temp < 3.0) return "100%";
@@ -873,7 +895,6 @@ String checkFrostRisk(float temp, int hour, int month) {
     
     return "0%";
 }
-
 
 void broadcastWeatherData() {
     if (currentPressure == 0) return;
@@ -1037,7 +1058,7 @@ void initDisplay() {
     tft.setCursor(20, 50);
     tft.print("SmartHome Hub");
     tft.setCursor(20, 70);
-    tft.print("Version 6.9");
+    tft.print("Version 7.0");
     delay(2000);
     tft.fillScreen(ST77XX_BLACK);
     Serial.println("OK");
@@ -1213,34 +1234,21 @@ void displayWeatherPage() {
     tft.setCursor(5, 80);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Prognoz:"));
-   
     
-    
-    
-    // Текстовая иконка погоды вместо графической
-    tft.setCursor(60, 80);
-    tft.setTextColor(ST77XX_CYAN);
-    tft.print(getWeatherText(weatherIcon));
+    // Текстовая иконка погоды на той же строке
+    if (currentPressure > 0) {
+        tft.setCursor(60, 80);
+        tft.setTextColor(ST77XX_CYAN);
+        tft.print(getWeatherText(weatherIcon));
+    }
     
     tft.setCursor(5, 100);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Zamorozki: "));
+    tft.setTextColor(ST77XX_RED);
+    tft.print(frostRisk);
     
-    if (frostRisk.indexOf("High") >= 0) {
-        tft.setTextColor(ST77XX_BLUE);
-    } else if (frostRisk.indexOf("Medium") >= 0) {
-        tft.setTextColor(ST77XX_ORANGE);
-    } else {
-        tft.setTextColor(ST77XX_GREEN);
-    }
-    
-    String frost = frostRisk;
-    if (frost.length() > 10) {
-        frost = frost.substring(0, 10);
-    }
-    tft.print(frost);
-    
-    draw_compass(130, 100, 18, windDirection, windCurrentSector, windMagnet);
+    draw_compass(120, 100, 18, windDirection, windCurrentSector, windMagnet);
 }
 
 void displayNodePage() {
@@ -1298,29 +1306,54 @@ void displayNodePage() {
         tft.print("OFF");
     }
     
-    if (node.id == 102 && node.connected) {
-        draw_compass(110, 105, 18, node.wind_angle, node.wind_sector, node.magnet);
-        
-        tft.setCursor(5, yOffset + 60);
-        tft.setTextColor(ST77XX_WHITE);
-        tft.print(rusToEng("Veter: "));
-        tft.print(node.wind_angle, 0);
-        tft.print("° ±");
-        tft.print(node.wind_sector, 0);
-        tft.print("°");
-        
-        tft.setCursor(5, yOffset + 72);
-        tft.print(rusToEng("Magnit: "));
-        tft.setTextColor(node.magnet ? ST77XX_GREEN : ST77XX_BLUE);
-        tft.print(node.magnet ? "OK" : "NO");
-    }
-    
     tft.fillRect(0, 150, 160, 10, ST77XX_GREEN);
     tft.setCursor(50, 152);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Uzel "));
     tft.print(displayNodeIndex + 1);
     tft.print("/4");
+}
+
+void displayGreenhousePage() {
+    tft.fillRect(0, 16, 160, 144, ST77XX_BLACK);
+    
+    tft.setCursor(5, 20);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print(rusToEng("Teplitsa"));
+    
+    tft.setCursor(5, 35);
+    tft.print(rusToEng("Temp in: "));
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.print(greenhouseDisplay.temp_in, 1);
+    tft.print("C");
+    
+    tft.setCursor(5, 50);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print(rusToEng("Temp out: "));
+    tft.setTextColor(ST77XX_CYAN);
+    tft.print(greenhouseDisplay.temp_out, 1);
+    tft.print("C");
+    
+    tft.setCursor(5, 65);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print(rusToEng("Hum in: "));
+    tft.setTextColor(ST77XX_GREEN);
+    tft.print(greenhouseDisplay.hum_in);
+    tft.print("%");
+    
+    tft.setCursor(5, 85);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print(rusToEng("Relay 1: "));
+    tft.fillCircle(60, 88, 4, greenhouseDisplay.relay1 ? ST77XX_GREEN : ST77XX_BLUE);
+    
+    tft.setCursor(90, 85);
+    tft.print(rusToEng("Relay 2: "));
+    tft.fillCircle(145, 88, 4, greenhouseDisplay.relay2 ? ST77XX_GREEN : ST77XX_BLUE);
+    
+    tft.fillRect(0, 150, 160, 10, ST77XX_GREEN);
+    tft.setCursor(50, 152);
+    tft.setTextColor(ST77XX_WHITE);
+    tft.print(rusToEng("Teplitsa"));
 }
 
 void displaySDPage() {
@@ -1399,19 +1432,20 @@ void draw_compass(int cx, int cy, int r, float angle, float sector, bool magnet)
         tft.drawLine(cx - r, cy - r, cx + r, cy + r, ST77XX_BLUE);
         tft.drawLine(cx - r, cy + r, cx + r, cy - r, ST77XX_BLUE);
         tft.setCursor(cx - 8, cy - 3);
-        tft.setTextColor(ST77XX_BLUE);
+        tft.setTextColor(ST77XX_RED);
         tft.print("NO");
         return;
     }
     
-        tft.setTextColor(ST77XX_RED);
-    tft.setCursor(cx - 2, cy - r + 2);  // N — чуть ниже верхнего края
+    // Буквы сторон света внутри круга
+    tft.setTextColor(ST77XX_RED);
+    tft.setCursor(cx - 2, cy - r + 2);
     tft.print("N");
-    tft.setCursor(cx + r - 8, cy - 3);  // E — чуть левее правого края
+    tft.setCursor(cx + r - 8, cy - 3);
     tft.print("E");
-    tft.setCursor(cx - 2, cy + r - 8);  // S — чуть выше нижнего края
+    tft.setCursor(cx - 2, cy + r - 8);
     tft.print("S");
-    tft.setCursor(cx - r + 2, cy - 3);  // W — чуть правее левого края
+    tft.setCursor(cx - r + 2, cy - 3);
     tft.print("W");
     
     if (sector > 0) {
@@ -1464,6 +1498,7 @@ void handleButtons() {
             
             if (currentPage == PAGE_WEATHER) displayWeatherPage();
             else if (currentPage == PAGE_NODE_INFO) displayNodePage();
+            else if (currentPage == PAGE_GREENHOUSE) displayGreenhousePage();
             else displaySDPage();
             
             buzzerBeep(50);
