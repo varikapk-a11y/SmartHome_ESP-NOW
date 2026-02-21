@@ -1,18 +1,11 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
- * ВЕРСИЯ 7.1: ФИНАЛЬНАЯ СТАБИЛЬНАЯ
- * - Прогноз по давлению (метод Zambretti)
- * - Риск заморозков (метод Броунова) в процентах
- * - Тренды давления и температуры
- * - Визуальные индикаторы на веб-странице
- * - Дисплей с русскими надписями (транслит)
- * - SD карта для хранения HTML и логов
- * - RTC часы
- * - Кнопки управления
- * - Зуммер
- * - Компас только со стрелкой (без секторов)
- * - Индикация концевиков на странице узла #102
- * - Убраны текстовые уведомления о тревоге на странице узла
+ * ВЕРСИЯ 7.4: НОВЫЙ ВЕРХНИЙ БАР И СИСТЕМА ТРЕВОГ
+ * - Название страницы в левом верхнем углу
+ * - Часы в правом верхнем углу (увеличенный шрифт)
+ * - Строка тревог под часами (красным)
+ * - SD индикация только при ошибках
+ * - Даты нет (перенесена на отдельную страницу)
  */
 
 #include <WiFi.h>
@@ -30,6 +23,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 #include <RTClib.h>
+#include <Fonts/FreeMono9pt7b.h>  // Для часов
 
 // ========== РУССКИЙ ТРАНСЛИТ ==========
 #include "rus_font.h"
@@ -67,7 +61,7 @@ SPIClass sdSPI = SPIClass(HSPI);
 // ========== КОНФИГУРАЦИЯ ХАБА ==========
 const char* AP_SSID = "SmartHome-Hub";
 const char* AP_PASSWORD = "12345678";
-const char* HUB_VERSION = "7.1";
+const char* HUB_VERSION = "7.4";
 const char* NODE_VERSION = "2.1";
 
 // MAC адреса узлов
@@ -100,8 +94,8 @@ struct NodeDisplayData {
     float wind_angle;
     float wind_sector;
     bool magnet;
-    bool contact1;  // Состояние концевика 1
-    bool contact2;  // Состояние концевика 2
+    bool contact1;
+    bool contact2;
 } nodeDisplayData[4] = {
     {102, 0, 0, 0, false, false, false, 0, 0, false, false, false},
     {103, 0, 0, 0, false, false, false, 0, 0, false, false, false},
@@ -231,6 +225,13 @@ char sdErrorMsg[32] = "";
 unsigned long lastBuzzerToggle = 0;
 bool buzzerState = false;
 
+// ========== ПЕРЕМЕННЫЕ ДЛЯ СИСТЕМЫ ТРЕВОГ ==========
+struct SystemAlert {
+    bool active;
+    char message[32];
+    unsigned long startTime;
+} systemAlert = {false, "", 0};
+
 // ========== УПРАВЛЕНИЕ СТРАНИЦАМИ ==========
 enum DisplayPage {
     PAGE_WEATHER,
@@ -252,6 +253,7 @@ const unsigned long DEBOUNCE_DELAY = 100;
 const unsigned long LONG_PRESS_MS = 1000;
 
 // ========== ПРОТОТИПЫ ==========
+void draw_compass(int cx, int cy, int r, float angle, bool magnet);
 void onWebSocketEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len);
 void onEspNowDataSent(const uint8_t *mac_addr, esp_now_send_status_t status);
 void onEspNowDataRecv(const uint8_t *mac_addr, const uint8_t *incomingData, int len);
@@ -281,8 +283,10 @@ void displayWeatherPage();
 void displayNodePage();
 void displayGreenhousePage();
 void displaySDPage();
-void drawTimeBar();
-void draw_compass(int cx, int cy, int r, float angle, bool magnet);
+void drawTopBar(const char* pageName);
+void checkSystemAlerts();
+void showAlert(const char* message);
+void clearAlert();
 void handleButtons();
 void buzzerBeep(int durationMs);
 void updateAlarmSound();
@@ -294,8 +298,8 @@ void checkHTMLFile();
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 7.1) ===");
-    Serial.println("=== ФИНАЛЬНАЯ СТАБИЛЬНАЯ ВЕРСИЯ ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 7.4) ===");
+    Serial.println("=== НОВЫЙ ВЕРХНИЙ БАР И СИСТЕМА ТРЕВОГ ===");
 
     // Инициализация пинов и периферии
     pinMode(TFT_LED, OUTPUT);
@@ -377,6 +381,7 @@ void loop() {
     ws.cleanupClients();
     checkNodeConnection();
     updateAlarmState();
+    checkSystemAlerts();
     
     if (now - lastEncoderBroadcastTime >= ENCODER_BROADCAST_INTERVAL) {
         updateMaxMin();
@@ -390,18 +395,15 @@ void loop() {
     
     if (now - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
         lastDisplayUpdate = now;
-        drawTimeBar();
-    }
-    
-    if (currentPage == PAGE_SD_MONITOR) {
-        static uint32_t lastSDInfoUpdate = 0;
-        if (now - lastSDInfoUpdate >= 1000) {
-            lastSDInfoUpdate = now;
-            if (sdInitialized) {
-                updateSDInfo();
-            }
-            displaySDPage();
+        // Обновляем только часы в верхнем баре
+        if (currentPage == PAGE_WEATHER) drawTopBar("METEOSTANCIYA");
+        else if (currentPage == PAGE_NODE_INFO) {
+            char title[20];
+            sprintf(title, "UZEL #%d", nodeDisplayData[displayNodeIndex].id);
+            drawTopBar(title);
         }
+        else if (currentPage == PAGE_GREENHOUSE) drawTopBar("TEPLITSA");
+        else if (currentPage == PAGE_SD_MONITOR) drawTopBar("SD KARTA");
     }
     
     if (sdInitialized && (now - lastSDWrite >= SD_WRITE_INTERVAL)) {
@@ -533,6 +535,10 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         if (currentPage == PAGE_WEATHER) {
             displayWeatherPage();
         }
+        // Обновляем страницу узла если она открыта
+        else if (currentPage == PAGE_NODE_INFO && displayIndex == displayNodeIndex) {
+            displayNodePage();
+        }
     }
     else if (strcmp(type, "security") == 0) {
         bool alarm = doc["alarm"];
@@ -550,8 +556,10 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         if (alarm && !securityAlarmActive && nodeId == 102) {
             securityAlarmActive = true;
             alarmStartTime = millis();
+            showAlert("KONTS RAZOMKNUT");
         } else if (!alarm && nodeId == 102) {
             securityAlarmActive = false;
+            clearAlert();
         }
         
         StaticJsonDocument<200> resp;
@@ -658,6 +666,7 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
                 if (displayIndex >= 0 && displayIndex < 4) {
                     nodeDisplayData[displayIndex].alarm = false;
                 }
+                clearAlert();
             }
             
             Serial.printf("Encoder: %.1f° magnet=yes\n", angle);
@@ -669,6 +678,7 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
                 if (displayIndex >= 0 && displayIndex < 4) {
                     nodeDisplayData[displayIndex].alarm = true;
                 }
+                showAlert("MAGNIT NET");
             }
             Serial.printf("Encoder: magnet=NO (%.1f°)\n", angle);
         }
@@ -680,6 +690,10 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         // Обновляем страницу метеостанции при новых данных энкодера
         if (currentPage == PAGE_WEATHER) {
             displayWeatherPage();
+        }
+        // Обновляем страницу узла если открыта
+        else if (currentPage == PAGE_NODE_INFO && displayIndex == displayNodeIndex) {
+            displayNodePage();
         }
     }
 }
@@ -744,6 +758,15 @@ void checkNodeConnection() {
                     if (i < 4) {
                         nodeDisplayData[i].connected = false;
                     }
+                    
+                    char alertMsg[20];
+                    sprintf(alertMsg, "UZEL #%d LOST", nodeNumbers[i]);
+                    showAlert(alertMsg);
+                    
+                    // Обновляем страницу узла если она открыта
+                    if (currentPage == PAGE_NODE_INFO && i == displayNodeIndex) {
+                        displayNodePage();
+                    }
                 }
             } else {
                 if (nodeConnectionLost[i]) {
@@ -753,6 +776,13 @@ void checkNodeConnection() {
                     
                     if (i < 4) {
                         nodeDisplayData[i].connected = true;
+                    }
+                    
+                    clearAlert();
+                    
+                    // Обновляем страницу узла если она открыта
+                    if (currentPage == PAGE_NODE_INFO && i == displayNodeIndex) {
+                        displayNodePage();
                     }
                 }
             }
@@ -772,6 +802,7 @@ void sendConnectionStatusToWeb(int nodeIndex, bool connected) {
 void updateAlarmState() {
     if (securityAlarmActive && (millis() - alarmStartTime) > ALARM_DURATION_MS) {
         securityAlarmActive = false;
+        clearAlert();
     }
 }
 
@@ -1057,6 +1088,14 @@ void broadcastEncoderData() {
 
 void initDisplay() {
     Serial.print("Init display... ");
+    pinMode(TFT_RST, OUTPUT);
+    
+    // Жесткий сброс дисплея
+    digitalWrite(TFT_RST, LOW);
+    delay(100);
+    digitalWrite(TFT_RST, HIGH);
+    delay(150);
+    
     pinMode(TFT_LED, OUTPUT);
     digitalWrite(TFT_LED, HIGH);
     
@@ -1069,7 +1108,7 @@ void initDisplay() {
     tft.setCursor(20, 50);
     tft.print("SmartHome Hub");
     tft.setCursor(20, 70);
-    tft.print("Version 7.1");
+    tft.print("Version 7.4");
     delay(2000);
     tft.fillScreen(ST77XX_BLACK);
     Serial.println("OK");
@@ -1083,6 +1122,7 @@ void initRTC() {
     if (!rtc.begin()) {
         Serial.println("FAIL");
         rtcOK = false;
+        showAlert("RTC OSHIBKA");
         return;
     }
     
@@ -1111,6 +1151,7 @@ void initSD() {
         Serial.println("FAIL");
         sdInitialized = false;
         strcpy(sdErrorMsg, "INIT FAIL");
+        showAlert("SD NET");
         return;
     }
     
@@ -1119,14 +1160,14 @@ void initSD() {
         Serial.println("NO CARD");
         sdInitialized = false;
         strcpy(sdErrorMsg, "NO CARD");
+        showAlert("SD NET");
         return;
     }
     
     sdInitialized = true;
     sdCardType = cardType;
     Serial.println("OK");
-    
-    updateSDInfo();
+    clearAlert();  // Если была ошибка SD, убираем
 }
 
 void checkHTMLFile() {
@@ -1142,6 +1183,7 @@ void checkHTMLFile() {
         Serial.printf("✅ HTML file found, size: %d bytes\n", size);
     } else {
         Serial.println("❌ HTML file not found! Create index.html on SD card");
+        showAlert("NET INDEX.HTML");
     }
 }
 
@@ -1175,6 +1217,8 @@ void testSDWrite() {
         dataFile.print(dataLine);
         dataFile.close();
         updateSDInfo();
+    } else {
+        showAlert("OSHIBKA ZAPISI SD");
     }
 }
 
@@ -1183,106 +1227,166 @@ String formatTime(int value) {
     return String(value);
 }
 
-void drawTimeBar() {
-    uint16_t barColor = securityAlarmActive ? ST77XX_BLUE : ST77XX_GREEN;
+// ========== НОВЫЙ ВЕРХНИЙ БАР ==========
+void drawTopBar(const char* pageName) {
+    // Очищаем только верхнюю строку
+    tft.fillRect(0, 0, 160, 18, ST77XX_BLACK);
     
-    if (!rtcOK) {
-        tft.fillRect(0, 0, 160, 15, barColor);
-        tft.setCursor(5, 3);
-        tft.setTextColor(ST77XX_RED);
-        tft.print(rusToEng("RTC OSHIBKA"));
-        return;
-    }
+    // Рисуем название страницы слева
+    tft.setCursor(2, 4);
+    tft.setTextColor(ST77XX_CYAN);  // Желтый на экране
+    tft.setTextSize(1);
+    tft.setFont();  // Стандартный шрифт
+    tft.print(pageName);
     
-    if (millis() - lastRTCReadTime >= RTC_READ_INTERVAL) {
+    // Получаем время
+    if (rtcOK && (millis() - lastRTCReadTime >= RTC_READ_INTERVAL)) {
         lastRTCRead = rtc.now();
         lastRTCReadTime = millis();
     }
     
-    sprintf(timeStr, "%02d:%02d", lastRTCRead.hour(), lastRTCRead.minute());
-    sprintf(dateStr, "%02d.%02d.%04d", lastRTCRead.day(), lastRTCRead.month(), lastRTCRead.year());
+    if (rtcOK) {
+        sprintf(timeStr, "%02d:%02d", lastRTCRead.hour(), lastRTCRead.minute());
+    } else {
+        strcpy(timeStr, "--:--");
+    }
     
-    tft.fillRect(0, 0, 160, 15, barColor);
-    tft.setCursor(5, 3);
-    tft.setTextColor(ST77XX_RED);
+    // Рисуем часы справа увеличенным шрифтом
+    tft.setFont(&FreeMono9pt7b);
+    tft.setTextColor(ST77XX_CYAN);  // Желтый на экране
+    
+    // Вычисляем ширину текста для выравнивания вправо
+    int16_t x1, y1;
+    uint16_t w, h;
+    tft.getTextBounds(timeStr, 0, 0, &x1, &y1, &w, &h);
+    tft.setCursor(158 - w, 12);  // Прижимаем к правому краю, Y=12 для 9pt шрифта
     tft.print(timeStr);
     
-    tft.setCursor(60, 3);
-    tft.print(dateStr);
-    
-    tft.setCursor(140, 3);
-    tft.setTextColor(sdInitialized ? ST77XX_RED : ST77XX_BLUE);
-    tft.print(sdInitialized ? "SD" : "NO");
+    tft.setFont();  // Возвращаем стандартный шрифт
 }
 
+// ========== СИСТЕМА ТРЕВОГ ==========
+void checkSystemAlerts() {
+    // Проверяем SD карту (только при ошибках)
+    if (!sdInitialized && !systemAlert.active) {
+        showAlert("SD NET");
+    }
+    
+    // Проверяем RTC
+    if (!rtcOK && !systemAlert.active) {
+        showAlert("RTC OSHIBKA");
+    }
+    
+    // Если тревога активна больше 5 секунд, но причина устранена
+    if (systemAlert.active && (millis() - systemAlert.startTime > 5000)) {
+        // Проверяем, осталась ли причина
+        bool reasonExists = false;
+        
+        if (!sdInitialized) reasonExists = true;
+        else if (!rtcOK) reasonExists = true;
+        else if (securityAlarmActive) reasonExists = true;
+        else {
+            for (int i = 0; i < NODE_COUNT; i++) {
+                if (nodeConnectionLost[i] || nodeAlarmState[i]) {
+                    reasonExists = true;
+                    break;
+                }
+            }
+        }
+        
+        if (!reasonExists) {
+            clearAlert();
+        }
+    }
+}
+
+void showAlert(const char* message) {
+    strncpy(systemAlert.message, message, 31);
+    systemAlert.message[31] = '\0';
+    systemAlert.active = true;
+    systemAlert.startTime = millis();
+    
+    // Рисуем сообщение под часами
+    tft.fillRect(0, 19, 160, 12, ST77XX_BLACK);
+    tft.setCursor(2, 21);
+    tft.setTextColor(ST77XX_BLUE);  // Красный на экране
+    tft.setTextSize(1);
+    tft.print(systemAlert.message);
+}
+
+void clearAlert() {
+    if (systemAlert.active) {
+        systemAlert.active = false;
+        tft.fillRect(0, 19, 160, 12, ST77XX_BLACK);
+    }
+}
+
+// ========== СТРАНИЦЫ ==========
 void displayWeatherPage() {
-    tft.fillRect(0, 16, 160, 144, ST77XX_BLACK);
+    tft.fillRect(0, 30, 160, 130, ST77XX_BLACK);
+    drawTopBar("METEOSTANCIYA");
     
-    tft.setCursor(5, 20);
+    int yPos = 35;
+    
+    tft.setCursor(5, yPos);
     tft.setTextColor(ST77XX_WHITE);
-    tft.print(rusToEng("Meteostanciya"));
-    
-    tft.setCursor(5, 35);
     tft.print(rusToEng("Temp: "));
-    tft.setTextColor(ST77XX_YELLOW);
+    tft.setTextColor(ST77XX_YELLOW);  // Голубой на экране
     tft.print(currentTemp, 1);
     tft.print("C");
     
+    tft.setCursor(5, yPos + 15);
     tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(5, 50);
     tft.print(rusToEng("Davlenie: "));
-    tft.setTextColor(ST77XX_CYAN);
+    tft.setTextColor(ST77XX_CYAN);  // Желтый на экране
     tft.print(currentPressure, 1);
     tft.print("mm");
     
+    tft.setCursor(5, yPos + 30);
     tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(5, 65);
     tft.print(rusToEng("Vlazhnost: "));
     tft.setTextColor(ST77XX_GREEN);
     tft.print(currentHumidity, 0);
     tft.print("%");
     
-    tft.setCursor(5, 80);
+    tft.setCursor(5, yPos + 45);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Prognoz:"));
     
-    // Текстовая иконка погоды на той же строке
     if (currentPressure > 0) {
-        tft.setCursor(60, 80);
+        tft.setCursor(60, yPos + 45);
         tft.setTextColor(ST77XX_CYAN);
         tft.print(getWeatherText(weatherIcon));
     }
     
-    tft.setCursor(5, 100);
+    tft.setCursor(5, yPos + 65);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Zamorozki: "));
-    tft.setTextColor(ST77XX_RED);
+    tft.setTextColor(ST77XX_YELLOW);  // Голубой на экране
     tft.print(frostRisk);
     
-    draw_compass(120, 100, 18, windDirection, windMagnet);
+    draw_compass(134, 110, 18, windDirection, windMagnet);
 }
 
 void displayNodePage() {
-    tft.fillRect(0, 16, 160, 144, ST77XX_BLACK);
+    tft.fillRect(0, 30, 160, 130, ST77XX_BLACK);
     
     NodeDisplayData &node = nodeDisplayData[displayNodeIndex];
+    char title[20];
+    sprintf(title, "UZEL #%d", node.id);
+    drawTopBar(title);
     
-    int yOffset = 25;
+    int yOffset = 35;
     
     tft.setCursor(5, yOffset);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.print(rusToEng("Uzel #"));
+    tft.setTextColor(node.connected ? ST77XX_WHITE : ST77XX_BLUE);
+    tft.print(rusToEng("UZEL #"));
     tft.print(node.id);
     
-    if (!node.connected) {
-        tft.setCursor(100, yOffset);
-        tft.setTextColor(ST77XX_BLUE);
-        tft.print("LOST");
-    }
-    
     tft.setCursor(5, yOffset + 12);
+    tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Temp: "));
-    tft.setTextColor(ST77XX_YELLOW);
+    tft.setTextColor(ST77XX_YELLOW);  // Голубой на экране
     tft.print(node.temp, 1);
     tft.print("C");
     
@@ -1296,7 +1400,7 @@ void displayNodePage() {
     tft.setCursor(5, yOffset + 36);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Davlenie: "));
-    tft.setTextColor(ST77XX_CYAN);
+    tft.setTextColor(ST77XX_CYAN);  // Желтый на экране
     tft.print(node.press, 1);
     tft.print("mm");
     
@@ -1304,91 +1408,97 @@ void displayNodePage() {
     tft.setTextColor(ST77XX_WHITE);
     tft.print("LED: ");
     if (node.led_state) {
-        tft.setTextColor(ST77XX_BLUE);
+        tft.setTextColor(ST77XX_BLUE);  // Красный на экране
         tft.print("ON");
     } else {
         tft.setTextColor(ST77XX_GREEN);
         tft.print("OFF");
     }
     
-    // Для узла #102 показываем концевики
     if (node.id == 102) {
         tft.setCursor(5, yOffset + 60);
+        tft.setTextColor(ST77XX_WHITE);
         tft.print(rusToEng("Konts1: "));
         tft.setTextColor(node.contact1 ? ST77XX_BLUE : ST77XX_GREEN);
         tft.print(node.contact1 ? "RAZOMKNUT" : "ZAMKNUT");
         
         tft.setCursor(5, yOffset + 72);
+        tft.setTextColor(ST77XX_WHITE);
         tft.print(rusToEng("Konts2: "));
         tft.setTextColor(node.contact2 ? ST77XX_BLUE : ST77XX_GREEN);
         tft.print(node.contact2 ? "RAZOMKNUT" : "ZAMKNUT");
         
         tft.setCursor(5, yOffset + 84);
+        tft.setTextColor(ST77XX_WHITE);
         tft.print(rusToEng("Magnit: "));
-        tft.setTextColor(node.magnet ? ST77XX_GREEN : ST77XX_BLUE);
-        tft.print(node.magnet ? "EST" : "NET");
+        if (node.magnet) {
+            tft.setTextColor(ST77XX_GREEN);
+            tft.print("OK");
+        } else {
+            tft.setTextColor(ST77XX_BLUE);  // Красный на экране
+            tft.print("---");
+        }
     }
     
     tft.fillRect(0, 150, 160, 10, ST77XX_GREEN);
     tft.setCursor(50, 152);
     tft.setTextColor(ST77XX_WHITE);
-    tft.print(rusToEng("Uzel "));
+    tft.print(rusToEng("UZEL "));
     tft.print(displayNodeIndex + 1);
     tft.print("/4");
 }
 
 void displayGreenhousePage() {
-    tft.fillRect(0, 16, 160, 144, ST77XX_BLACK);
+    tft.fillRect(0, 30, 160, 130, ST77XX_BLACK);
+    drawTopBar("TEPLITSA");
     
-    tft.setCursor(5, 20);
+    int yPos = 35;
+    
+    tft.setCursor(5, yPos);
     tft.setTextColor(ST77XX_WHITE);
-    tft.print(rusToEng("Teplitsa"));
-    
-    tft.setCursor(5, 35);
     tft.print(rusToEng("Temp in: "));
-    tft.setTextColor(ST77XX_YELLOW);
+    tft.setTextColor(ST77XX_YELLOW);  // Голубой на экране
     tft.print(greenhouseDisplay.temp_in, 1);
     tft.print("C");
     
-    tft.setCursor(5, 50);
+    tft.setCursor(5, yPos + 15);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Temp out: "));
-    tft.setTextColor(ST77XX_CYAN);
+    tft.setTextColor(ST77XX_CYAN);  // Желтый на экране
     tft.print(greenhouseDisplay.temp_out, 1);
     tft.print("C");
     
-    tft.setCursor(5, 65);
+    tft.setCursor(5, yPos + 30);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Hum in: "));
     tft.setTextColor(ST77XX_GREEN);
     tft.print(greenhouseDisplay.hum_in);
     tft.print("%");
     
-    tft.setCursor(5, 85);
+    tft.setCursor(5, yPos + 50);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Relay 1: "));
-    tft.fillCircle(60, 88, 4, greenhouseDisplay.relay1 ? ST77XX_GREEN : ST77XX_BLUE);
+    tft.fillCircle(60, yPos + 53, 4, greenhouseDisplay.relay1 ? ST77XX_GREEN : ST77XX_BLUE);
     
-    tft.setCursor(90, 85);
+    tft.setCursor(90, yPos + 50);
     tft.print(rusToEng("Relay 2: "));
-    tft.fillCircle(145, 88, 4, greenhouseDisplay.relay2 ? ST77XX_GREEN : ST77XX_BLUE);
+    tft.fillCircle(145, yPos + 53, 4, greenhouseDisplay.relay2 ? ST77XX_GREEN : ST77XX_BLUE);
     
     tft.fillRect(0, 150, 160, 10, ST77XX_GREEN);
     tft.setCursor(50, 152);
     tft.setTextColor(ST77XX_WHITE);
-    tft.print(rusToEng("Teplitsa"));
+    tft.print(rusToEng("TEPLITSA"));
 }
 
 void displaySDPage() {
-    tft.fillRect(0, 16, 160, 144, ST77XX_BLACK);
+    tft.fillRect(0, 30, 160, 130, ST77XX_BLACK);
+    drawTopBar("SD KARTA");
     
-    tft.setCursor(5, 20);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.print(rusToEng("SD KARTA"));
+    int yPos = 35;
     
     if (!sdInitialized) {
-        tft.setCursor(5, 40);
-        tft.setTextColor(ST77XX_BLUE);
+        tft.setCursor(5, yPos);
+        tft.setTextColor(ST77XX_BLUE);  // Красный на экране
         tft.print(rusToEng("OSHI BKA: "));
         tft.print(sdErrorMsg);
         return;
@@ -1396,7 +1506,7 @@ void displaySDPage() {
     
     updateSDInfo();
     
-    tft.setCursor(5, 35);
+    tft.setCursor(5, yPos);
     tft.setTextColor(ST77XX_CYAN);
     tft.print(rusToEng("Tip: "));
     tft.setTextColor(ST77XX_WHITE);
@@ -1405,21 +1515,21 @@ void displaySDPage() {
     else if (sdCardType == CARD_SDHC) tft.print("SDHC");
     else tft.print("UNKNOWN");
     
-    tft.setCursor(5, 47);
+    tft.setCursor(5, yPos + 12);
     tft.setTextColor(ST77XX_CYAN);
     tft.print(rusToEng("Razmer: "));
     tft.setTextColor(ST77XX_WHITE);
     tft.print(sdTotalBytes);
     tft.print(" MB");
     
-    tft.setCursor(5, 59);
+    tft.setCursor(5, yPos + 24);
     tft.setTextColor(ST77XX_CYAN);
     tft.print(rusToEng("Zanyato: "));
     tft.setTextColor(ST77XX_YELLOW);
     tft.print(sdUsedBytes);
     tft.print(" MB");
     
-    tft.setCursor(5, 71);
+    tft.setCursor(5, yPos + 36);
     tft.setTextColor(ST77XX_CYAN);
     tft.print(rusToEng("Svobodno: "));
     tft.setTextColor(ST77XX_GREEN);
@@ -1427,20 +1537,20 @@ void displaySDPage() {
     tft.print(" MB");
     
     int percent = (sdUsedBytes * 100) / sdTotalBytes;
-    tft.fillRect(5, 86, 150, 10, ST77XX_BLUE);
-    tft.fillRect(5, 86, (150 * percent) / 100, 10, ST77XX_GREEN);
-    tft.setCursor(60, 87);
+    tft.fillRect(5, yPos + 50, 150, 10, ST77XX_BLUE);
+    tft.fillRect(5, yPos + 50, (150 * percent) / 100, 10, ST77XX_GREEN);
+    tft.setCursor(60, yPos + 51);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(percent);
     tft.print("%");
     
-    tft.setCursor(5, 105);
+    tft.setCursor(5, yPos + 70);
     tft.setTextColor(ST77XX_CYAN);
     tft.print(rusToEng("Zapisey: "));
     tft.setTextColor(ST77XX_WHITE);
     tft.print(sdWriteCount);
     
-    tft.setCursor(5, 120);
+    tft.setCursor(5, yPos + 85);
     tft.setTextColor(ST77XX_CYAN);
     tft.print(rusToEng("Fayl: "));
     tft.setTextColor(ST77XX_WHITE);
@@ -1455,13 +1565,13 @@ void draw_compass(int cx, int cy, int r, float angle, bool magnet) {
         tft.drawLine(cx - r, cy - r, cx + r, cy + r, ST77XX_BLUE);
         tft.drawLine(cx - r, cy + r, cx + r, cy - r, ST77XX_BLUE);
         tft.setCursor(cx - 8, cy - 3);
-        tft.setTextColor(ST77XX_RED);
+        tft.setTextColor(ST77XX_BLUE);
         tft.print("NO");
         return;
     }
     
-    // Буквы сторон света внутри круга
-    tft.setTextColor(ST77XX_RED);
+    // Буквы сторон света красным (ST77XX_BLUE)
+    tft.setTextColor(ST77XX_BLUE);
     tft.setCursor(cx - 2, cy - r + 2);
     tft.print("N");
     tft.setCursor(cx + r - 8, cy - 3);
@@ -1479,6 +1589,7 @@ void draw_compass(int cx, int cy, int r, float angle, bool magnet) {
     tft.fillCircle(cx, cy, 2, ST77XX_BLUE);
 }
 
+// ========== КНОПКИ И ЗВУК ==========
 void handleButtons() {
     unsigned long now = millis();
     
@@ -1540,13 +1651,7 @@ void buzzerBeep(int durationMs) {
 }
 
 void updateAlarmSound() {
-    bool anyAlarm = false;
-    for (int i = 0; i < NODE_COUNT; i++) {
-        if (nodeAlarmState[i] && !nodeConnectionLost[i]) {
-            anyAlarm = true;
-            break;
-        }
-    }
+    bool anyAlarm = systemAlert.active || securityAlarmActive;
     
     if (anyAlarm) {
         if (millis() - lastBuzzerToggle > 300) {
