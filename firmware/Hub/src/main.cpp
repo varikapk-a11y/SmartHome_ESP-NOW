@@ -1,6 +1,6 @@
 /**
  * SmartHome ESP-NOW Hub (ESP32)
- * ВЕРСИЯ 7.0: ФИНАЛЬНАЯ СТАБИЛЬНАЯ
+ * ВЕРСИЯ 7.1: ФИНАЛЬНАЯ СТАБИЛЬНАЯ
  * - Прогноз по давлению (метод Zambretti)
  * - Риск заморозков (метод Броунова) в процентах
  * - Тренды давления и температуры
@@ -10,9 +10,9 @@
  * - RTC часы
  * - Кнопки управления
  * - Зуммер
- * - Компас на странице метеостанции (без артефактов)
- * - Страница теплицы
- * - Исправлены все артефакты при отсутствии SD
+ * - Компас только со стрелкой (без секторов)
+ * - Индикация концевиков на странице узла #102
+ * - Убраны текстовые уведомления о тревоге на странице узла
  */
 
 #include <WiFi.h>
@@ -67,7 +67,7 @@ SPIClass sdSPI = SPIClass(HSPI);
 // ========== КОНФИГУРАЦИЯ ХАБА ==========
 const char* AP_SSID = "SmartHome-Hub";
 const char* AP_PASSWORD = "12345678";
-const char* HUB_VERSION = "7.0";
+const char* HUB_VERSION = "7.1";
 const char* NODE_VERSION = "2.1";
 
 // MAC адреса узлов
@@ -100,11 +100,13 @@ struct NodeDisplayData {
     float wind_angle;
     float wind_sector;
     bool magnet;
+    bool contact1;  // Состояние концевика 1
+    bool contact2;  // Состояние концевика 2
 } nodeDisplayData[4] = {
-    {102, 0, 0, 0, false, false, false, 0, 0, false},
-    {103, 0, 0, 0, false, false, false, 0, 0, false},
-    {104, 0, 0, 0, false, false, false, 0, 0, false},
-    {105, 0, 0, 0, false, false, false, 0, 0, false}
+    {102, 0, 0, 0, false, false, false, 0, 0, false, false, false},
+    {103, 0, 0, 0, false, false, false, 0, 0, false, false, false},
+    {104, 0, 0, 0, false, false, false, 0, 0, false, false, false},
+    {105, 0, 0, 0, false, false, false, 0, 0, false, false, false}
 };
 
 // ========== ДАННЫЕ ТЕПЛИЦЫ ДЛЯ ДИСПЛЕЯ ==========
@@ -280,7 +282,7 @@ void displayNodePage();
 void displayGreenhousePage();
 void displaySDPage();
 void drawTimeBar();
-void draw_compass(int cx, int cy, int r, float angle, float sector, bool magnet);
+void draw_compass(int cx, int cy, int r, float angle, bool magnet);
 void handleButtons();
 void buzzerBeep(int durationMs);
 void updateAlarmSound();
@@ -292,7 +294,7 @@ void checkHTMLFile();
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 7.0) ===");
+    Serial.println("\n=== SmartHome ESP-NOW Hub (Версия 7.1) ===");
     Serial.println("=== ФИНАЛЬНАЯ СТАБИЛЬНАЯ ВЕРСИЯ ===");
 
     // Инициализация пинов и периферии
@@ -385,14 +387,6 @@ void loop() {
     // Функции периферии
     handleButtons();
     updateAlarmSound();
-    
-    if (currentPage == PAGE_NODE_INFO && nodeDisplayData[displayNodeIndex].alarm) {
-        if (now - lastBlinkTime > 500) {
-            alarmBlinkState = !alarmBlinkState;
-            lastBlinkTime = now;
-            displayNodePage();
-        }
-    }
     
     if (now - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL) {
         lastDisplayUpdate = now;
@@ -542,10 +536,15 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
     }
     else if (strcmp(type, "security") == 0) {
         bool alarm = doc["alarm"];
+        bool c1 = doc["contact1"];
+        bool c2 = doc["contact2"];
+        
         nodeAlarmState[nodeIndex] = alarm;
         
         if (displayIndex >= 0 && displayIndex < 4) {
             nodeDisplayData[displayIndex].alarm = alarm;
+            nodeDisplayData[displayIndex].contact1 = c1;
+            nodeDisplayData[displayIndex].contact2 = c2;
         }
         
         if (alarm && !securityAlarmActive && nodeId == 102) {
@@ -559,9 +558,16 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         resp["type"] = "security";
         resp["node"] = nodeId;
         resp["alarm"] = alarm;
+        resp["contact1"] = c1;
+        resp["contact2"] = c2;
         String json;
         serializeJson(resp, json);
         ws.textAll(json);
+        
+        // Обновляем страницу узла
+        if (currentPage == PAGE_NODE_INFO && displayIndex == displayNodeIndex) {
+            displayNodePage();
+        }
     }
     else if (strcmp(type, "ack") == 0) {
         const char* cmd = doc["command"];
@@ -669,6 +675,11 @@ void processNodeData(const uint8_t *data, int len, int nodeIndex) {
         
         if (displayIndex >= 0 && displayIndex < 4) {
             nodeDisplayData[displayIndex].wind_sector = windCurrentSector;
+        }
+        
+        // Обновляем страницу метеостанции при новых данных энкодера
+        if (currentPage == PAGE_WEATHER) {
+            displayWeatherPage();
         }
     }
 }
@@ -1058,7 +1069,7 @@ void initDisplay() {
     tft.setCursor(20, 50);
     tft.print("SmartHome Hub");
     tft.setCursor(20, 70);
-    tft.print("Version 7.0");
+    tft.print("Version 7.1");
     delay(2000);
     tft.fillScreen(ST77XX_BLACK);
     Serial.println("OK");
@@ -1248,7 +1259,7 @@ void displayWeatherPage() {
     tft.setTextColor(ST77XX_RED);
     tft.print(frostRisk);
     
-    draw_compass(120, 100, 18, windDirection, windCurrentSector, windMagnet);
+    draw_compass(120, 100, 18, windDirection, windMagnet);
 }
 
 void displayNodePage() {
@@ -1256,24 +1267,18 @@ void displayNodePage() {
     
     NodeDisplayData &node = nodeDisplayData[displayNodeIndex];
     
-    if (!node.connected) {
-        tft.fillRect(0, 18, 160, 12, ST77XX_BLUE);
-        tft.setCursor(5, 20);
-        tft.setTextColor(ST77XX_WHITE);
-        tft.print(rusToEng("NET SVYAZI!"));
-    } else if (node.alarm) {
-        tft.fillRect(0, 18, 160, 12, alarmBlinkState ? ST77XX_BLUE : ST77XX_GREEN);
-        tft.setCursor(5, 20);
-        tft.setTextColor(ST77XX_WHITE);
-        tft.print(rusToEng("TREVOGA!"));
-    }
-    
-    int yOffset = (node.connected && !node.alarm) ? 25 : 35;
+    int yOffset = 25;
     
     tft.setCursor(5, yOffset);
     tft.setTextColor(ST77XX_WHITE);
     tft.print(rusToEng("Uzel #"));
     tft.print(node.id);
+    
+    if (!node.connected) {
+        tft.setCursor(100, yOffset);
+        tft.setTextColor(ST77XX_BLUE);
+        tft.print("LOST");
+    }
     
     tft.setCursor(5, yOffset + 12);
     tft.print(rusToEng("Temp: "));
@@ -1304,6 +1309,24 @@ void displayNodePage() {
     } else {
         tft.setTextColor(ST77XX_GREEN);
         tft.print("OFF");
+    }
+    
+    // Для узла #102 показываем концевики
+    if (node.id == 102) {
+        tft.setCursor(5, yOffset + 60);
+        tft.print(rusToEng("Konts1: "));
+        tft.setTextColor(node.contact1 ? ST77XX_BLUE : ST77XX_GREEN);
+        tft.print(node.contact1 ? "RAZOMKNUT" : "ZAMKNUT");
+        
+        tft.setCursor(5, yOffset + 72);
+        tft.print(rusToEng("Konts2: "));
+        tft.setTextColor(node.contact2 ? ST77XX_BLUE : ST77XX_GREEN);
+        tft.print(node.contact2 ? "RAZOMKNUT" : "ZAMKNUT");
+        
+        tft.setCursor(5, yOffset + 84);
+        tft.print(rusToEng("Magnit: "));
+        tft.setTextColor(node.magnet ? ST77XX_GREEN : ST77XX_BLUE);
+        tft.print(node.magnet ? "EST" : "NET");
     }
     
     tft.fillRect(0, 150, 160, 10, ST77XX_GREEN);
@@ -1424,7 +1447,7 @@ void displaySDPage() {
     tft.print("weather.csv");
 }
 
-void draw_compass(int cx, int cy, int r, float angle, float sector, bool magnet) {
+void draw_compass(int cx, int cy, int r, float angle, bool magnet) {
     tft.fillCircle(cx, cy, r, ST77XX_WHITE);
     tft.drawCircle(cx, cy, r, ST77XX_BLACK);
     
@@ -1448,16 +1471,7 @@ void draw_compass(int cx, int cy, int r, float angle, float sector, bool magnet)
     tft.setCursor(cx - r + 2, cy - 3);
     tft.print("W");
     
-    if (sector > 0) {
-        float start_rad = radians(angle - sector/2 - 90);
-        float end_rad = radians(angle + sector/2 - 90);
-        for (float a = start_rad; a <= end_rad; a += 0.03) {
-            int x1 = cx + r * cos(a);
-            int y1 = cy + r * sin(a);
-            tft.drawPixel(x1, y1, ST77XX_BLUE);
-        }
-    }
-    
+    // Стрелка направления
     float arrow_rad = radians(angle - 90);
     int x_end = cx + (r-4) * cos(arrow_rad);
     int y_end = cy + (r-4) * sin(arrow_rad);
