@@ -1150,13 +1150,33 @@ void initSD() {
     
     sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
     
-    if (!SD.begin(SD_CS, sdSPI, 4000000)) {
+    // Даем время SD карте на стабилизацию после включения питания
+delay(500);
+
+int sdInitAttempts = 0;
+bool sdInitSuccess = false;
+
+while (sdInitAttempts < 3 && !sdInitSuccess) {
+    sdInitAttempts++;
+    Serial.printf("SD init attempt %d/3... ", sdInitAttempts);
+    
+    if (SD.begin(SD_CS, sdSPI, 4000000)) {
+        sdInitSuccess = true;
+        Serial.println("OK");
+    } else {
         Serial.println("FAIL");
-        sdInitialized = false;
-        strcpy(sdErrorMsg, "INIT FAIL");
-        showAlert("SD NET");
-        return;
+        if (sdInitAttempts < 3) {
+            delay(300 * sdInitAttempts); // Увеличиваем задержку: 300мс, 600мс
+        }
     }
+}
+
+if (!sdInitSuccess) {
+    sdInitialized = false;
+    strcpy(sdErrorMsg, "INIT FAIL");
+    showAlert("SD NET");
+    return;
+}
     
     uint8_t cardType = SD.cardType();
     if (cardType == CARD_NONE) {
